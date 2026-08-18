@@ -64,7 +64,7 @@ class CAR(Platforms):
   # 2019 China BM / Axela GEN1 identity. Specs reuse MAZDA_3 body numbers as closest
   # proven GEN1 3-series values; year range intentionally not expanded beyond evidence.
   # DBC is the Mazid BM dictionary (not global BP mazda_3_2019.dbc).
-  # dashcamOnly / minSteerSpeed remain conservative via interface.py (not CX5_2022 exceptions).
+  # DRIVE-MVP-001: dashcamOnly=false and minSteerSpeed=0 via interface.py (Safety unchanged).
   MAZDA_3_2019 = MazdaPlatformConfig(
     [MazdaCarDocs("Mazda 3 2019")],
     MAZDA_3.specs,

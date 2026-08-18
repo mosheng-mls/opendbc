@@ -72,10 +72,12 @@ class TestMazda32019Fw(unittest.TestCase):
     self.assertIn(CAR.MAZDA_3_2019, FW_VERSIONS)
     self.assertEqual(len(FW_VERSIONS[CAR.MAZDA_3_2019]), 6)
 
-  def test_control_capability_conservative(self):
+  def test_control_capability_driving_mvp(self):
+    # DRIVE-MVP-001 product targets (Safety model unchanged)
     CP = CarInterface.get_non_essential_params(CAR.MAZDA_3_2019)
-    self.assertTrue(CP.dashcamOnly)
-    self.assertGreater(CP.minSteerSpeed, 0.0)
+    self.assertFalse(CP.dashcamOnly)
+    self.assertEqual(CP.minSteerSpeed, 0.0)
+    self.assertEqual(CP.safetyConfigs[0].safetyModel, CarParams.SafetyModel.mazda)
 
   def test_real6_exact(self):
     exact, matches = candidates(six_authoritative())

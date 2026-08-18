@@ -3,6 +3,7 @@ from opendbc.car import Bus, structs
 from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
+from opendbc.car.mazda.icbm import MazdaIcbmController
 from opendbc.car.mazda.values import CarControllerParams, Buttons
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
@@ -14,6 +15,7 @@ class CarController(CarControllerBase):
     self.apply_torque_last = 0
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.brake_counter = 0
+    self.icbm = MazdaIcbmController()
 
   def update(self, CC, CS, now_nanos):
     can_sends = []
@@ -42,6 +44,18 @@ class CarController(CarControllerBase):
         # Mazda Stop and Go requires a RES button (or gas) press if the car stops more than 3 seconds
         # Send Resume button when planner wants car to move
         can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
+      else:
+        # Mazid ICBM: SET+/SET− so stock ACC tracks planner target (hudControl.setSpeed)
+        if self.frame % 10 == 0:
+          button = self.icbm.update(
+            self.frame,
+            enabled=CC.enabled,
+            cruise_enabled=CS.out.cruiseState.enabled,
+            cruise_speed_ms=float(CS.out.cruiseState.speed),
+            target_speed_ms=float(CC.hudControl.setSpeed),
+          )
+          if button is not None:
+            can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, button))
 
     self.apply_torque_last = apply_torque
 

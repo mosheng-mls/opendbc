@@ -17,14 +17,17 @@ class CarInterface(CarInterfaceBase):
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.mazda)]
     ret.radarUnavailable = True
 
-    ret.dashcamOnly = candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_CX9_2021)
+    # Driving MVP (DRIVE-MVP-001): MAZDA_3_2019 is a first-class drivable platform.
+    # Do not reuse CX5_2022 as a live identity substitute — only share capability flags here.
+    ret.dashcamOnly = candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_CX9_2021, CAR.MAZDA_3_2019)
 
     ret.steerActuatorDelay = 0.1
     ret.steerLimitTimer = 0.8
 
     CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
 
-    if candidate not in (CAR.MAZDA_CX5_2022,):
+    # Product requirement: minSteerSpeed = 0 (not a Safety disable).
+    if candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_3_2019):
       ret.minSteerSpeed = LKAS_LIMITS.DISABLE_SPEED * CV.KPH_TO_MS
 
     ret.centerToFront = ret.wheelbase * 0.41
