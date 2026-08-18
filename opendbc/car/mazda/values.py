@@ -61,6 +61,15 @@ class CAR(Platforms):
     [MazdaCarDocs("Mazda 3 2017-18")],
     MazdaCarSpecs(mass=2875 * CV.LB_TO_KG, wheelbase=2.7, steerRatio=14.0)
   )
+  # 2019 China BM / Axela GEN1 identity. Specs reuse MAZDA_3 body numbers as closest
+  # proven GEN1 3-series values; year range intentionally not expanded beyond evidence.
+  # DBC is the Mazid BM dictionary (not global BP mazda_3_2019.dbc).
+  # dashcamOnly / minSteerSpeed remain conservative via interface.py (not CX5_2022 exceptions).
+  MAZDA_3_2019 = MazdaPlatformConfig(
+    [MazdaCarDocs("Mazda 3 2019")],
+    MAZDA_3.specs,
+    dbc_dict={Bus.pt: 'mazda_3_2019_bm'},
+  )
   MAZDA_6 = MazdaPlatformConfig(
     [MazdaCarDocs("Mazda 6 2017-20")],
     MazdaCarSpecs(mass=3443 * CV.LB_TO_KG, wheelbase=2.83, steerRatio=15.5)
