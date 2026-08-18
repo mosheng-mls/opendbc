@@ -34,6 +34,8 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
     if (msg->addr == MAZDA_CRZ_CTRL) {
       bool cruise_engaged = msg->data[0] & 0x8U;
       pcm_cruise_check(cruise_engaged);
+      // SOURCE: sunnypilot/opendbc mazda.h + vendor 4f5c464 mazda.h (DRIVE-MVP-001B MADS acc_main)
+      acc_main_on = GET_BIT(msg, 17U);
     }
 
     if (msg->addr == MAZDA_ENGINE_DATA) {

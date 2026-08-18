@@ -2,6 +2,7 @@
 import unittest
 
 from opendbc.car.structs import CarParams
+from opendbc.safety import ALTERNATIVE_EXPERIENCE
 from opendbc.safety.tests.libsafety import libsafety_py
 import opendbc.safety.tests.common as common
 from opendbc.safety.tests.common import CANPackerSafety, make_msg
@@ -79,6 +80,33 @@ class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTes
     self.safety.set_controls_allowed(1)
     self.assertTrue(self._tx(self._button_msg(cancel=True)))
     self.assertTrue(self._tx(self._button_msg(resume=True)))
+
+  def _acc_main_msg(self, available, active=False):
+    values = {"CRZ_AVAILABLE": int(available), "CRZ_ACTIVE": int(active)}
+    return self.packer.make_can_msg_safety("CRZ_CTRL", 0, values)
+
+  def test_mads_off_blocks_torque_without_cruise(self):
+    self.safety.set_alternative_experience(0)
+    self.safety.set_controls_allowed(0)
+    self.safety.set_desired_torque_last(0)
+    self.safety.set_rt_torque_last(0)
+    self.safety.set_torque_driver(0, 0)
+    self.assertFalse(self._tx(self._torque_cmd_msg(100)))
+
+  def test_mads_on_allows_torque_after_acc_main(self):
+    self.safety.set_alternative_experience(ALTERNATIVE_EXPERIENCE.ENABLE_MADS)
+    self.safety.set_controls_allowed(0)
+    self.safety.set_desired_torque_last(0)
+    self.safety.set_rt_torque_last(0)
+    self.safety.set_torque_driver(0, 0)
+    self._rx(self._acc_main_msg(False))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._tx(self._torque_cmd_msg(100)))
+    self._rx(self._acc_main_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertTrue(self._tx(self._torque_cmd_msg(10)))
+
 
 
 class TestMazdaIgnition(unittest.TestCase):

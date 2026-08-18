@@ -40,6 +40,7 @@ void set_controls_allowed(bool c){
 
 void set_alternative_experience(int mode){
   alternative_experience = mode;
+  mads_set_alternative_experience(&alternative_experience);
 }
 
 void set_relay_malfunction(bool c){
@@ -52,6 +53,10 @@ void set_ignition_can(bool c){
 
 bool get_controls_allowed(void){
   return controls_allowed;
+}
+
+bool get_controls_allowed_lateral(void){
+  return controls_allowed_lateral;
 }
 
 bool get_ignition_can(void){

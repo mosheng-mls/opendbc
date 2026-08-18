@@ -321,6 +321,7 @@ extern CurvatureSteeringState curvature_state;
 #define ALT_EXP_ALLOW_AEB 16
 
 extern int alternative_experience;
+extern bool controls_allowed_lateral;
 
 // time since safety mode has been changed
 extern uint32_t safety_mode_cnt;
