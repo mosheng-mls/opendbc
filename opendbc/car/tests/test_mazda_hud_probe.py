@@ -3,12 +3,18 @@ from __future__ import annotations
 
 import csv
 import inspect
+import json
 import os
 import tempfile
 import unittest
+from enum import Enum
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from opendbc.can import CANPacker, CANParser
 from opendbc.car import structs
+from opendbc.car.mazda import mazdacan
+from opendbc.car.mazda.carcontroller import CarController
 from opendbc.car.mazda.control_engagement import ControlMode, LANE_LINES_ACTIVE, LANE_LINES_STANDBY
 from opendbc.car.mazda.hud_bridge import HudInputs, MazidHudBridge
 from opendbc.car.mazda.hud_probe import (
@@ -19,12 +25,15 @@ from opendbc.car.mazda.hud_probe import (
   MAX_SAFE,
   MAX_SAFE_VISUAL_PAYLOAD_MAP,
   MazidHudProbe,
+  ProbeTick,
   TICKS_MAX_SAFE,
   VEGO_ABORT,
   max_safe_conflicts,
+  normalize_gear,
 )
+from opendbc.car.mazda.interface import CarInterface
 from opendbc.car.mazda.mazdacan import create_alert_command, create_steering_control
-from opendbc.car.mazda.values import CarControllerParams
+from opendbc.car.mazda.values import CAR, DBC, CarControllerParams
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 GearShifter = structs.CarState.GearShifter
@@ -90,6 +99,355 @@ def _run_until_gid(p: MazidHudProbe, gid: str, **kw):
     if tick.gid == gid and tick.static:
       return tick
   raise AssertionError(f"never reached {gid}")
+
+
+def _dynamic_gear(value):
+  state = structs.CarState.new_message()
+  state.gearShifter = value
+  return state.gearShifter
+
+
+def _new_controller():
+  cp = CarInterface.get_non_essential_params(CAR.MAZDA_3_2019)
+  controller = CarController(DBC[CAR.MAZDA_3_2019], cp)
+  controller.hud_probe = None
+  return controller
+
+
+def _controller_io():
+  state = structs.CarState.new_message()
+  state.gearShifter = GearShifter.park
+  state.standstill = True
+  state.vEgo = 0.0
+  state.vCruise = 0.0
+  state.steeringTorque = 0.0
+  state.steeringPressed = False
+  state.brakePressed = False
+  state.steerFaultTemporary = False
+  state.steerFaultPermanent = False
+  state.cruiseState.available = False
+  state.cruiseState.enabled = False
+  state.cruiseState.speed = 0.0
+
+  control = structs.CarControl.new_message()
+  control.enabled = False
+  control.latActive = False
+  control.actuators.torque = 0.0
+
+  cs = SimpleNamespace(
+    out=state.as_reader(),
+    crz_btns_counter=0,
+    lkas_allowed_speed=True,
+    cam_lkas={"BIT_1": 0, "ERR_BIT_1": 0, "ERR_BIT_2": 0},
+    cam_laneinfo=_cam(),
+  )
+  return control.as_reader(), cs
+
+
+def _run_controller(controller, cycles=200):
+  control, state = _controller_io()
+  return [controller.update(control, state, i)[1] for i in range(cycles)]
+
+
+def _messages(frames, address):
+  return [msg for frame in frames for msg in frame if msg[0] == address]
+
+
+def _lkas_counters(messages):
+  parser = CANParser("mazda_3_2019_bm", [("CAM_LKAS", 100)], 0)
+  counters = []
+  for address, payload, _bus in messages:
+    parser.update([(0, [(address, payload, 0)])])
+    counters.append(int(parser.vl["CAM_LKAS"]["CTR"]))
+  return counters
+
+
+class _StaticProbe:
+  def __init__(self):
+    self.calls = 0
+    self.failure_reason = ""
+
+  def update(self, **_kwargs):
+    self.calls += 1
+    item = GALLERY[0]
+    return ProbeTick(True, item, item.display, "", "STATIC", item.gid, "gallery")
+
+  def log_tx(self, **_kwargs):
+    return True
+
+
+class _UpdateFailureProbe(_StaticProbe):
+  def update(self, **_kwargs):
+    self.calls += 1
+    raise RuntimeError("injected probe update failure")
+
+
+class _LogFailureProbe(_StaticProbe):
+  def log_tx(self, **_kwargs):
+    raise ValueError("injected probe log failure")
+
+
+class _BridgeFailure:
+  def __init__(self):
+    self.calls = 0
+
+  def update(self, _inputs):
+    self.calls += 1
+    raise RuntimeError("injected HudBridge update failure")
+
+
+class TestHudProbeGearSerialization(unittest.TestCase):
+  def test_dynamic_enum_begin_tx_abort_are_json_safe(self):
+    with tempfile.TemporaryDirectory(prefix="hud_probe_enum_") as td:
+      log_path = os.path.join(td, "probe.jsonl")
+      probe = MazidHudProbe(label_path=os.path.join(td, "label"), log_path=log_path)
+      park = _dynamic_gear(GearShifter.park)
+      drive = _dynamic_gear(GearShifter.drive)
+      self.assertEqual(type(park).__name__, "_DynamicEnum")
+      with self.assertRaises(TypeError):
+        int(park)
+
+      probe.update(standstill=True, v_ego=0.0, gear=park, steer_fault_permanent=False, now_ns=1)
+      probe.update(standstill=True, v_ego=0.0, gear=park, steer_fault_permanent=False, now_ns=2)
+      self.assertTrue(probe.log_tx(
+        gid="HUD-G01", payload_hex="00", v_ego=0.0, gear=park, standstill=True, now_ns=3,
+      ))
+      tick = probe.update(
+        standstill=False, v_ego=1.0, gear=drive, steer_fault_permanent=False, now_ns=4,
+      )
+      self.assertEqual(tick.phase, "ABORT")
+      self.assertEqual(probe.failure_reason, "")
+
+      with open(log_path, encoding="utf-8") as f:
+        records = [json.loads(line) for line in f]
+      begin = next(r for r in records if r["event"] == "HUD_PROBE_BEGIN")
+      tx = next(r for r in records if r["event"] == "HUD_PROBE_TX")
+      abort = next(r for r in records if r["event"] == "STATIC_GALLERY_ABORT")
+      self.assertEqual(begin["gear"], "park")
+      self.assertEqual(tx["gear"], "park")
+      self.assertEqual(abort["gear"], "drive")
+
+  def test_normalize_gear_supports_enum_int_and_string(self):
+    class OrdinaryGear(Enum):
+      PARK = 1
+
+    self.assertEqual(normalize_gear(OrdinaryGear.PARK), "park")
+    self.assertEqual(normalize_gear(1), "park")
+    self.assertEqual(normalize_gear("park"), "park")
+    self.assertEqual(normalize_gear("GearShifter.PARK"), "park")
+    self.assertEqual(normalize_gear("4"), "reverse")
+
+    class BrokenGear:
+      @property
+      def raw(self):
+        raise TypeError("broken raw")
+
+    self.assertEqual(normalize_gear(BrokenGear()), "unavailable")
+
+  def test_json_and_file_failures_do_not_escape_probe(self):
+    probe = _park_probe()
+    with patch("opendbc.car.mazda.hud_probe.json.dumps", side_effect=TypeError("json failure")):
+      self.assertFalse(probe.log_tx(
+        gid="HUD-G01", payload_hex="00", v_ego=0.0, gear=_dynamic_gear(GearShifter.park),
+        standstill=True, now_ns=1,
+      ))
+    self.assertIn("log:TypeError", probe.failure_reason)
+
+    probe = _park_probe()
+    with patch("builtins.open", side_effect=ValueError("write failure")):
+      self.assertFalse(probe.log_tx(
+        gid="HUD-G01", payload_hex="00", v_ego=0.0, gear=GearShifter.park,
+        standstill=True, now_ns=1,
+      ))
+    self.assertIn("log:ValueError", probe.failure_reason)
+
+    probe = _park_probe()
+    with patch("builtins.open", side_effect=RuntimeError("label failure")):
+      self.assertFalse(probe._write_label("HUD-G01"))
+    self.assertIn("label:RuntimeError", probe.failure_reason)
+
+
+class TestHudFailureIsolation(unittest.TestCase):
+  @classmethod
+  def setUpClass(cls):
+    cls.baseline_frames = _run_controller(_new_controller())
+    cls.baseline_steering_payloads = [msg[1] for msg in _messages(cls.baseline_frames, 0x243)]
+
+  def assert_continuous_control(self, frames, expected_hud_count):
+    steering = _messages(frames, 0x243)
+    self.assertEqual(len(frames), 200)
+    self.assertEqual(len(steering), 200)
+    self.assertEqual([msg[1] for msg in steering], self.baseline_steering_payloads)
+    self.assertEqual(_lkas_counters(steering), [i % 16 for i in range(200)])
+    self.assertEqual(len(_messages(frames, 0x440)), expected_hud_count)
+    self.assertTrue(all(sum(msg[0] == 0x440 for msg in frame) <= 1 for frame in frames))
+    self.assertEqual(_messages(frames, 0x09D), [])
+
+  def test_real_dynamic_enum_probe_runs_200_cycles(self):
+    controller = _new_controller()
+    with tempfile.TemporaryDirectory(prefix="hud_probe_controller_") as td:
+      log_path = os.path.join(td, "probe.jsonl")
+      controller.hud_probe = MazidHudProbe(label_path=os.path.join(td, "label"), log_path=log_path)
+      frames = _run_controller(controller)
+      self.assert_continuous_control(frames, expected_hud_count=4)
+      self.assertFalse(controller.hud_probe_disabled)
+      self.assertFalse(controller.hud_deployment_blocked)
+      with open(log_path, encoding="utf-8") as f:
+        records = [json.loads(line) for line in f]
+    self.assertTrue(any(r["event"] == "HUD_PROBE_BEGIN" and r["gear"] == "park" for r in records))
+    self.assertTrue(any(r["event"] == "HUD_PROBE_TX" and r["gear"] == "park" for r in records))
+
+  def test_probe_update_failure_latches_and_runs_200_cycles(self):
+    controller = _new_controller()
+    probe = _UpdateFailureProbe()
+    controller.hud_probe = probe
+    with self.assertLogs("opendbc.car.mazda.carcontroller", level="ERROR") as logs:
+      frames = _run_controller(controller)
+    self.assert_continuous_control(frames, expected_hud_count=4)
+    self.assertEqual(probe.calls, 1)
+    self.assertTrue(controller.hud_probe_disabled)
+    self.assertTrue(controller.hud_deployment_blocked)
+    self.assertIn("feature=hud_probe.update", controller.hud_last_fault)
+    self.assertTrue(any("DEPLOYMENT_BLOCKED" in line for line in logs.output))
+
+  def test_probe_begin_serialization_failure_is_reported_and_latched(self):
+    controller = _new_controller()
+    with tempfile.TemporaryDirectory(prefix="hud_probe_json_failure_") as td:
+      controller.hud_probe = MazidHudProbe(
+        label_path=os.path.join(td, "label"), log_path=os.path.join(td, "probe.jsonl"),
+      )
+      with self.assertLogs("opendbc.car.mazda.carcontroller", level="ERROR"):
+        with patch("opendbc.car.mazda.hud_probe.json.dumps", side_effect=TypeError("injected BEGIN serialization failure")):
+          frames = _run_controller(controller)
+    self.assert_continuous_control(frames, expected_hud_count=4)
+    self.assertTrue(controller.hud_probe_disabled)
+    self.assertTrue(controller.hud_deployment_blocked)
+    self.assertIn("feature=hud_probe.update", controller.hud_last_fault)
+
+  def test_probe_log_failure_latches_and_falls_back_same_tick(self):
+    controller = _new_controller()
+    probe = _LogFailureProbe()
+    controller.hud_probe = probe
+    with self.assertLogs("opendbc.car.mazda.carcontroller", level="ERROR"):
+      frames = _run_controller(controller)
+    self.assert_continuous_control(frames, expected_hud_count=4)
+    self.assertEqual(probe.calls, 1)
+    self.assertTrue(controller.hud_probe_disabled)
+    self.assertIn("feature=hud_probe.log_tx", controller.hud_last_fault)
+
+  def test_probe_candidate_pack_typeerror_falls_back_same_tick(self):
+    controller = _new_controller()
+    probe = _StaticProbe()
+    controller.hud_probe = probe
+    real_create_alert = mazdacan.create_alert_command
+
+    def injected(*args, **kwargs):
+      if kwargs.get("hands_warn_3") is not None:
+        raise TypeError("injected probe candidate pack failure")
+      return real_create_alert(*args, **kwargs)
+
+    with self.assertLogs("opendbc.car.mazda.carcontroller", level="ERROR"):
+      with patch.object(mazdacan, "create_alert_command", side_effect=injected):
+        frames = _run_controller(controller)
+    self.assert_continuous_control(frames, expected_hud_count=4)
+    self.assertEqual(probe.calls, 1)
+    self.assertTrue(controller.hud_probe_disabled)
+    self.assertIn("feature=hud_probe.pack", controller.hud_last_fault)
+
+  def test_bridge_update_failure_replays_exact_oem_copy(self):
+    controller = _new_controller()
+    bridge = _BridgeFailure()
+    controller.hud_bridge = bridge
+    expected = _pack(next(g.display for g in GALLERY if g.gid == "HUD-G00"), _cam())[1]
+    with self.assertLogs("opendbc.car.mazda.carcontroller", level="ERROR"):
+      frames = _run_controller(controller)
+    self.assert_continuous_control(frames, expected_hud_count=4)
+    self.assertEqual(bridge.calls, 1)
+    self.assertTrue(controller.hud_enhancement_disabled)
+    self.assertTrue(all(msg[1] == expected for msg in _messages(frames, 0x440)))
+    self.assertIn("feature=hud_bridge.update", controller.hud_last_fault)
+
+  def test_enhanced_pack_valueerror_replays_exact_oem_copy(self):
+    controller = _new_controller()
+    real_create_alert = mazdacan.create_alert_command
+
+    def injected(*args, **kwargs):
+      if not kwargs.get("copy_oem", False):
+        raise ValueError("injected enhanced pack failure")
+      return real_create_alert(*args, **kwargs)
+
+    expected = _pack(next(g.display for g in GALLERY if g.gid == "HUD-G00"), _cam())[1]
+    with self.assertLogs("opendbc.car.mazda.carcontroller", level="ERROR"):
+      with patch.object(mazdacan, "create_alert_command", side_effect=injected):
+        frames = _run_controller(controller)
+    self.assert_continuous_control(frames, expected_hud_count=4)
+    self.assertTrue(controller.hud_enhancement_disabled)
+    self.assertTrue(all(msg[1] == expected for msg in _messages(frames, 0x440)))
+    self.assertIn("feature=hud_bridge.pack", controller.hud_last_fault)
+
+  def test_transient_oem_copy_failure_recovers_on_next_hud_tick(self):
+    controller = _new_controller()
+    controller.hud_enhancement_disabled = True
+    real_create_alert = mazdacan.create_alert_command
+    attempts = 0
+
+    def injected(*args, **kwargs):
+      nonlocal attempts
+      if kwargs.get("copy_oem", False):
+        attempts += 1
+        if attempts == 1:
+          raise ValueError("injected transient OEM-copy failure")
+      return real_create_alert(*args, **kwargs)
+
+    with self.assertLogs("opendbc.car.mazda.carcontroller", level="ERROR"):
+      with patch.object(mazdacan, "create_alert_command", side_effect=injected):
+        frames = _run_controller(controller)
+    self.assert_continuous_control(frames, expected_hud_count=3)
+    self.assertEqual(attempts, 4)
+    self.assertFalse(controller.hud_oem_copy_fault_active)
+    self.assertTrue(controller.hud_deployment_blocked)
+    self.assertIn("feature=hud_oem_copy.pack", controller.hud_last_fault)
+
+  def test_persistent_oem_copy_failure_sends_no_fake_or_duplicate(self):
+    controller = _new_controller()
+    controller.hud_enhancement_disabled = True
+
+    def injected(*_args, **kwargs):
+      if kwargs.get("copy_oem", False):
+        raise TypeError("injected persistent OEM-copy failure")
+      raise AssertionError("enhanced HUD must stay disabled")
+
+    with self.assertLogs("opendbc.car.mazda.carcontroller", level="ERROR") as logs:
+      with patch.object(mazdacan, "create_alert_command", side_effect=injected):
+        frames = _run_controller(controller)
+    self.assert_continuous_control(frames, expected_hud_count=0)
+    self.assertTrue(controller.hud_oem_copy_fault_active)
+    self.assertTrue(controller.hud_deployment_blocked)
+    self.assertEqual(len(controller.hud_faults), 1)
+    self.assertEqual(sum("feature=hud_oem_copy.pack" in line for line in logs.output), 1)
+
+  def test_core_steering_packer_exception_still_propagates(self):
+    controller = _new_controller()
+    controller.hud_probe = _UpdateFailureProbe()
+    control, state = _controller_io()
+    with patch.object(mazdacan, "create_steering_control", side_effect=RuntimeError("core steering failure")):
+      with self.assertRaisesRegex(RuntimeError, "core steering failure"):
+        controller.update(control, state, 0)
+    self.assertEqual(controller.frame, 0)
+    self.assertFalse(controller.hud_deployment_blocked)
+
+  def test_core_icbm_exception_still_propagates(self):
+    class BrokenIcbm:
+      def update(self, *_args, **_kwargs):
+        raise ValueError("core ICBM failure")
+
+    controller = _new_controller()
+    controller.icbm = BrokenIcbm()
+    control, state = _controller_io()
+    with self.assertRaisesRegex(ValueError, "core ICBM failure"):
+      controller.update(control, state, 0)
+    self.assertEqual(controller.frame, 0)
+    self.assertFalse(controller.hud_deployment_blocked)
 
 
 class TestHudProbeStaticGallery(unittest.TestCase):

@@ -1,3 +1,5 @@
+import logging
+
 from opendbc.can import CANPacker
 from opendbc.car import Bus
 from opendbc.car.lateral import apply_driver_steer_torque_limits
@@ -8,6 +10,8 @@ from opendbc.car.mazda.hud_probe import MazidHudProbe, probe_enabled
 from opendbc.car.mazda.icbm import MazdaIcbmController, persistent_cruise_target_ms
 from opendbc.car.mazda.values import CarControllerParams, Buttons
 
+LOGGER = logging.getLogger(__name__)
+
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP):
@@ -16,8 +20,182 @@ class CarController(CarControllerBase):
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.brake_counter = 0
     self.icbm = MazdaIcbmController()
-    self.hud_bridge = MazidHudBridge()
-    self.hud_probe = MazidHudProbe() if probe_enabled() else None
+    self.hud_faults: list[str] = []
+    self.hud_last_fault = ""
+    self.hud_deployment_blocked = False
+    self.hud_probe_disabled = False
+    self.hud_enhancement_disabled = False
+    self.hud_oem_copy_fault_active = False
+    self._hud_fault_features: set[str] = set()
+
+    self.hud_bridge = None
+    try:
+      self.hud_bridge = MazidHudBridge()
+    except Exception as exc:
+      self._disable_hud_enhancement("hud_bridge.init", exc)
+
+    self.hud_probe = None
+    try:
+      if probe_enabled():
+        self.hud_probe = MazidHudProbe()
+    except Exception as exc:
+      self._disable_hud_probe("hud_probe.init", exc)
+
+  def _record_hud_fault(self, feature: str, exc: Exception) -> None:
+    """Latch one visible deployment-blocking result for an optional HUD failure."""
+    self.hud_deployment_blocked = True
+    try:
+      detail = str(exc)
+    except Exception:
+      detail = "<unprintable>"
+    reason = f"NON_CRITICAL_FEATURE_FAILURE feature={feature} error={type(exc).__name__}:{detail} DEPLOYMENT_BLOCKED"
+    self.hud_last_fault = reason
+
+    if feature not in self._hud_fault_features:
+      self._hud_fault_features.add(feature)
+      self.hud_faults.append(reason)
+      try:
+        LOGGER.exception(reason)
+      except Exception:
+        # Failure reporting is itself non-critical and must not escape this boundary.
+        pass
+
+  def _disable_hud_probe(self, feature: str, exc: Exception) -> None:
+    self._record_hud_fault(feature, exc)
+    self.hud_probe_disabled = True
+    self.hud_probe = None
+
+  def _disable_hud_enhancement(self, feature: str, exc: Exception) -> None:
+    self._record_hud_fault(feature, exc)
+    self.hud_enhancement_disabled = True
+
+  @staticmethod
+  def _valid_hud_message(msg):
+    if msg[0] != 0x440:
+      raise ValueError(f"unexpected HUD address: {msg[0]!r}")
+    return msg
+
+  def _send_oem_hud_copy(self, cam, can_sends) -> None:
+    """Best-effort baseline replay; retry after transient failures on later HUD ticks."""
+    try:
+      msg = self._valid_hud_message(mazdacan.create_alert_command(
+        self.packer, cam, False, False, copy_oem=True,
+      ))
+    except Exception as exc:
+      self.hud_oem_copy_fault_active = True
+      self._record_hud_fault("hud_oem_copy.pack", exc)
+      return
+
+    recovered = self.hud_oem_copy_fault_active
+    self.hud_oem_copy_fault_active = False
+    can_sends.append(msg)
+    if recovered:
+      try:
+        LOGGER.warning("NON_CRITICAL_FEATURE_RECOVERY feature=hud_oem_copy.pack deployment_remains_blocked")
+      except Exception:
+        pass
+
+  def _update_optional_hud(self, CC, CS, now_nanos, cam, can_sends) -> None:
+    # Probe-only operations are isolated individually. Any failure discards the
+    # candidate and falls through to HudBridge in the same 2 Hz tick.
+    if self.hud_probe is not None and not self.hud_probe_disabled:
+      probe_tick = None
+      try:
+        probe_tick = self.hud_probe.update(
+          standstill=bool(CS.out.standstill),
+          v_ego=float(CS.out.vEgo),
+          gear=CS.out.gearShifter,
+          steer_fault_permanent=bool(CS.out.steerFaultPermanent),
+          now_ns=int(now_nanos),
+        )
+        probe_failure = getattr(self.hud_probe, "failure_reason", "")
+        if probe_failure:
+          raise RuntimeError(f"probe reported failure: {probe_failure}")
+      except Exception as exc:
+        self._disable_hud_probe("hud_probe.update", exc)
+
+      if probe_tick is not None and self.hud_probe is not None:
+        try:
+          if probe_tick.static and probe_tick.display is not None:
+            d = probe_tick.display
+            msg = self._valid_hud_message(mazdacan.create_alert_command(
+              self.packer, cam, False, False,
+              lane_lines=None if d.copy_oem else d.lane_lines,
+              line_visible=None if d.copy_oem else d.line_visible,
+              line_not_visible=None if d.copy_oem else d.line_not_visible,
+              hands_on=None if d.copy_oem else d.hands_on,
+              hands_on_2=None if d.copy_oem else d.hands_on_2,
+              hands_warn_3=None if d.copy_oem else d.hands_warn_3,
+              copy_oem=d.copy_oem,
+            ))
+          else:
+            msg = None
+        except Exception as exc:
+          self._disable_hud_probe("hud_probe.pack", exc)
+          msg = None
+
+        if msg is not None and self.hud_probe is not None:
+          try:
+            logged = self.hud_probe.log_tx(
+              gid=probe_tick.gid,
+              payload_hex=msg[1].hex(),
+              v_ego=float(CS.out.vEgo),
+              gear=CS.out.gearShifter,
+              standstill=bool(CS.out.standstill),
+              now_ns=int(now_nanos),
+            )
+            probe_failure = getattr(self.hud_probe, "failure_reason", "")
+            if logged is False or probe_failure:
+              raise RuntimeError(f"probe log failure: {probe_failure or 'unknown'}")
+          except Exception as exc:
+            self._disable_hud_probe("hud_probe.log_tx", exc)
+          else:
+            can_sends.append(msg)
+            return
+
+    # HudBridge policy and enhanced packing are also optional, but kept in
+    # separate boundaries so a healthy packer can still replay OEM 0x440.
+    if not self.hud_enhancement_disabled and self.hud_bridge is not None:
+      try:
+        hud = self.hud_bridge.update(HudInputs(
+          lat_active=bool(CC.latActive),
+          enabled=bool(CC.enabled),
+          visual_alert=CC.hudControl.visualAlert,
+          gear=CS.out.gearShifter,
+          standstill=bool(CS.out.standstill),
+          lkas_allowed_speed=bool(CS.lkas_allowed_speed),
+          steer_fault_temporary=bool(CS.out.steerFaultTemporary),
+          steer_fault_permanent=bool(CS.out.steerFaultPermanent),
+          oem_hands_on=bool(cam.get("HANDS_ON_STEER_WARN", 0)),
+          cruise_available=bool(CS.out.cruiseState.available),
+          cruise_enabled=bool(CS.out.cruiseState.enabled),
+          v_cruise_kph=float(CS.out.vCruise),
+          hud_set_speed_kph=float(CC.hudControl.setSpeed),
+          fsc_lane_lines=int(cam.get("LANE_LINES", 1) or 1),
+          left_lane_visible=bool(CC.hudControl.leftLaneVisible),
+          right_lane_visible=bool(CC.hudControl.rightLaneVisible),
+          actuators_torque=float(CC.actuators.torque),
+          steering_pressed=bool(CS.out.steeringPressed),
+          brake_pressed=bool(CS.out.brakePressed),
+          cancel=bool(CC.cruiseControl.cancel),
+        ))
+      except Exception as exc:
+        self._disable_hud_enhancement("hud_bridge.update", exc)
+      else:
+        try:
+          msg = self._valid_hud_message(mazdacan.create_alert_command(
+            self.packer, cam, hud.ldw, hud.steer_required,
+            lane_lines=hud.override_lane_lines,
+            line_visible=hud.line_visible,
+            line_not_visible=hud.line_not_visible,
+          ))
+        except Exception as exc:
+          self._disable_hud_enhancement("hud_bridge.pack", exc)
+        else:
+          can_sends.append(msg)
+          return
+
+    self._send_oem_hud_copy(cam, can_sends)
 
   def update(self, CC, CS, now_nanos):
     can_sends = []
@@ -62,73 +240,21 @@ class CarController(CarControllerBase):
 
     self.apply_torque_last = apply_torque
 
+    # Core 0x243 replay is deliberately outside every optional HUD boundary.
+    # Packer errors here must continue to propagate.
+    can_sends.append(mazdacan.create_steering_control(self.packer, self.CP,
+                                                      self.frame, apply_torque, CS.cam_lkas))
+
     # send HUD alerts (2 Hz). Policy in HudBridge; packing in mazdacan.
     # DISPLAY_ONLY 0x440 path. Does not change 0x243 torque or ICBM buttons.
     if self.frame % 50 == 0:
-      cam = CS.cam_laneinfo or {}
-      probe_tick = None
-      if self.hud_probe is not None:
-        probe_tick = self.hud_probe.update(
-          standstill=bool(CS.out.standstill),
-          v_ego=float(CS.out.vEgo),
-          gear=CS.out.gearShifter,
-          steer_fault_permanent=bool(CS.out.steerFaultPermanent),
-          now_ns=int(now_nanos),
-        )
-      if probe_tick is not None and probe_tick.static and probe_tick.display is not None:
-        d = probe_tick.display
-        msg = mazdacan.create_alert_command(
-          self.packer, cam, False, False,
-          lane_lines=None if d.copy_oem else d.lane_lines,
-          line_visible=None if d.copy_oem else d.line_visible,
-          line_not_visible=None if d.copy_oem else d.line_not_visible,
-          hands_on=None if d.copy_oem else d.hands_on,
-          hands_on_2=None if d.copy_oem else d.hands_on_2,
-          hands_warn_3=None if d.copy_oem else d.hands_warn_3,
-          copy_oem=d.copy_oem,
-        )
-        self.hud_probe.log_tx(
-          gid=probe_tick.gid,
-          payload_hex=msg[1].hex(),
-          v_ego=float(CS.out.vEgo),
-          gear=int(CS.out.gearShifter),
-          standstill=bool(CS.out.standstill),
-          now_ns=int(now_nanos),
-        )
-        can_sends.append(msg)
+      try:
+        cam = CS.cam_laneinfo or {}
+      except Exception as exc:
+        self._disable_hud_enhancement("hud.cam_laneinfo", exc)
+        self.hud_oem_copy_fault_active = True
       else:
-        hud = self.hud_bridge.update(HudInputs(
-          lat_active=bool(CC.latActive),
-          enabled=bool(CC.enabled),
-          visual_alert=CC.hudControl.visualAlert,
-          gear=CS.out.gearShifter,
-          standstill=bool(CS.out.standstill),
-          lkas_allowed_speed=bool(CS.lkas_allowed_speed),
-          steer_fault_temporary=bool(CS.out.steerFaultTemporary),
-          steer_fault_permanent=bool(CS.out.steerFaultPermanent),
-          oem_hands_on=bool(cam.get("HANDS_ON_STEER_WARN", 0)),
-          cruise_available=bool(CS.out.cruiseState.available),
-          cruise_enabled=bool(CS.out.cruiseState.enabled),
-          v_cruise_kph=float(CS.out.vCruise),
-          hud_set_speed_kph=float(CC.hudControl.setSpeed),
-          fsc_lane_lines=int(cam.get("LANE_LINES", 1) or 1),
-          left_lane_visible=bool(CC.hudControl.leftLaneVisible),
-          right_lane_visible=bool(CC.hudControl.rightLaneVisible),
-          actuators_torque=float(CC.actuators.torque),
-          steering_pressed=bool(CS.out.steeringPressed),
-          brake_pressed=bool(CS.out.brakePressed),
-          cancel=bool(CC.cruiseControl.cancel),
-        ))
-        can_sends.append(mazdacan.create_alert_command(
-          self.packer, cam, hud.ldw, hud.steer_required,
-          lane_lines=hud.override_lane_lines,
-          line_visible=hud.line_visible,
-          line_not_visible=hud.line_not_visible,
-        ))
-
-    # send steering command
-    can_sends.append(mazdacan.create_steering_control(self.packer, self.CP,
-                                                      self.frame, apply_torque, CS.cam_lkas))
+        self._update_optional_hud(CC, CS, now_nanos, cam, can_sends)
 
     new_actuators = CC.actuators.as_builder()
     new_actuators.torque = apply_torque / CarControllerParams.STEER_MAX

@@ -17,6 +17,19 @@ from opendbc.car import structs
 
 GearShifter = structs.CarState.GearShifter
 
+_GEAR_NAME_BY_RAW = {
+  GearShifter.unknown: "unknown",
+  GearShifter.park: "park",
+  GearShifter.drive: "drive",
+  GearShifter.neutral: "neutral",
+  GearShifter.reverse: "reverse",
+  GearShifter.sport: "sport",
+  GearShifter.low: "low",
+  GearShifter.brake: "brake",
+  GearShifter.eco: "eco",
+  GearShifter.manumatic: "manumatic",
+}
+
 PROBE_MARKER = "/data/openpilot_mazid_hud_probe_03/.mazid_hud_probe"
 LABEL_PATH = "/dev/shm/mazid_hud_probe_label"
 LOG_PATH = "/data/mazid_hud_probe_03.log"
@@ -47,6 +60,52 @@ def probe_enabled() -> bool:
   if os.environ.get("MAZID_HUD_PROBE") == "1":
     return True
   return os.path.isfile(PROBE_MARKER)
+
+
+def normalize_gear(gear: object) -> str:
+  """Return one stable, JSON-safe gear name for capnp and ordinary values."""
+  try:
+    if gear is None:
+      return "none"
+    if isinstance(gear, str):
+      text = gear
+    elif isinstance(gear, bool):
+      return "true" if gear else "false"
+    elif isinstance(gear, int):
+      return _GEAR_NAME_BY_RAW.get(gear, f"raw:{gear}")
+    else:
+      raw = getattr(gear, "raw", None)
+      if raw is not None:
+        raw_int = int(raw)
+        return _GEAR_NAME_BY_RAW.get(raw_int, f"raw:{raw_int}")
+
+      name = getattr(gear, "name", None)
+      if isinstance(name, str):
+        text = name
+      else:
+        value = getattr(gear, "value", None)
+        if isinstance(value, int) and not isinstance(value, bool):
+          return _GEAR_NAME_BY_RAW.get(value, f"raw:{value}")
+        text = str(gear)
+
+    token = text.strip().lower().rsplit(".", 1)[-1]
+    if token in _GEAR_NAME_BY_RAW.values():
+      return token
+    try:
+      raw_int = int(token)
+    except (TypeError, ValueError):
+      return token or "empty"
+    return _GEAR_NAME_BY_RAW.get(raw_int, f"raw:{raw_int}")
+  except Exception:
+    # Probe diagnostics must never be able to terminate CarController.
+    return "unavailable"
+
+
+def _safe_json_default(value: object) -> str:
+  try:
+    return str(value)
+  except Exception:
+    return "<unserializable>"
 
 
 @dataclass(frozen=True)
@@ -180,43 +239,58 @@ class MazidHudProbe:
     self.started = False
     self._last_gid = ""
     self._item_t0 = 0
+    self.failure_reason = ""
 
-  def _write_label(self, text: str) -> None:
+  def _mark_failure(self, stage: str, exc: Exception) -> None:
+    if self.failure_reason:
+      return
+    try:
+      detail = str(exc)
+    except Exception:
+      detail = "<unprintable>"
+    self.failure_reason = f"{stage}:{type(exc).__name__}:{detail}"
+
+  def _write_label(self, text: str) -> bool:
     try:
       d = os.path.dirname(self.label_path)
       if d:
         os.makedirs(d, exist_ok=True)
       with open(self.label_path, "w", encoding="utf-8") as f:
         f.write(text)
-    except OSError:
-      pass
+      return True
+    except Exception as exc:
+      self._mark_failure("label", exc)
+      return False
 
-  def _log(self, rec: dict) -> None:
-    rec["wall_unix"] = time.time()
-    line = json.dumps(rec, ensure_ascii=False)
+  def _log(self, rec: dict) -> bool:
     try:
+      record = dict(rec)
+      record["wall_unix"] = time.time()
+      line = json.dumps(record, ensure_ascii=False, default=_safe_json_default)
       with open(self.log_path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
-    except OSError:
-      pass
+      return True
+    except Exception as exc:
+      self._mark_failure("log", exc)
+      return False
 
-  def log_tx(self, *, gid: str, payload_hex: str, v_ego: float, gear: int,
-             standstill: bool, now_ns: int) -> None:
-    self._log({
+  def log_tx(self, *, gid: str, payload_hex: str, v_ego: float, gear: object,
+             standstill: bool, now_ns: int) -> bool:
+    return self._log({
       "event": "HUD_PROBE_TX",
       "HUD_PROBE_PHASE_ID": gid,
       "payload_hex": payload_hex,
       "v_ego": v_ego,
-      "gear": gear,
+      "gear": normalize_gear(gear),
       "standstill": standstill,
       "mono_ns": now_ns,
     })
 
-  def _static_ok(self, *, standstill: bool, v_ego: float, gear: int,
+  def _static_ok(self, *, standstill: bool, v_ego: float, gear: object,
                  steer_fault_permanent: bool) -> bool:
     if steer_fault_permanent:
       return False
-    if gear in (GearShifter.drive, GearShifter.reverse):
+    if normalize_gear(gear) in ("drive", "reverse"):
       return False
     if not standstill:
       return False
@@ -224,7 +298,7 @@ class MazidHudProbe:
       return False
     return True
 
-  def update(self, *, standstill: bool, v_ego: float, gear: int,
+  def update(self, *, standstill: bool, v_ego: float, gear: object,
              steer_fault_permanent: bool, now_ns: int = 0) -> ProbeTick:
     if self.aborted or self.finished:
       self._write_label("")
@@ -235,7 +309,7 @@ class MazidHudProbe:
       if self.started:
         self.aborted = True
         self._log({"event": "STATIC_GALLERY_ABORT", "gid": self._last_gid,
-                   "v_ego": v_ego, "gear": int(gear), "standstill": standstill, "mono_ns": now_ns})
+                   "v_ego": v_ego, "gear": normalize_gear(gear), "standstill": standstill, "mono_ns": now_ns})
         self._write_label("")
         return ProbeTick(False, None, None, "", "ABORT", self._last_gid, "move_or_gear")
       self._confirm = 0
@@ -263,7 +337,7 @@ class MazidHudProbe:
       self._log({"event": "HUD_PROBE_BEGIN", "gid": item.gid, "name": item.name,
                  "HUD_PROBE_PHASE_ID": item.gid, "HUD_PROBE_STATE_NAME": item.name,
                  "startMonoTime": now_ns, "fields": _fields(item.display),
-                 "v_ego": v_ego, "gear": int(gear), "standstill": standstill})
+                 "v_ego": v_ego, "gear": normalize_gear(gear), "standstill": standstill})
 
     total = GALLERY_COUNT
     label = f"HUD {item.gid} / {total}\n{item.label_cn}"
