@@ -66,17 +66,28 @@ class CarController(CarControllerBase):
       cam = CS.cam_laneinfo or {}
       hud = self.hud_bridge.update(HudInputs(
         lat_active=bool(CC.latActive),
+        enabled=bool(CC.enabled),
         visual_alert=CC.hudControl.visualAlert,
         gear=CS.out.gearShifter,
         standstill=bool(CS.out.standstill),
         lkas_allowed_speed=bool(CS.lkas_allowed_speed),
         steer_fault_temporary=bool(CS.out.steerFaultTemporary),
+        steer_fault_permanent=bool(CS.out.steerFaultPermanent),
         oem_hands_on=bool(cam.get("HANDS_ON_STEER_WARN", 0)),
+        cruise_available=bool(CS.out.cruiseState.available),
         cruise_enabled=bool(CS.out.cruiseState.enabled),
+        v_cruise_kph=float(CS.out.vCruise),
+        hud_set_speed_kph=float(CC.hudControl.setSpeed),
+        fsc_lane_lines=int(cam.get("LANE_LINES", 1) or 1),
         left_lane_visible=bool(CC.hudControl.leftLaneVisible),
         right_lane_visible=bool(CC.hudControl.rightLaneVisible),
+        actuators_torque=float(CC.actuators.torque),
+        steering_pressed=bool(CS.out.steeringPressed),
+        brake_pressed=bool(CS.out.brakePressed),
+        cancel=bool(CC.cruiseControl.cancel),
       ))
-      can_sends.append(mazdacan.create_alert_command(self.packer, cam, hud.ldw, hud.steer_required))
+      can_sends.append(mazdacan.create_alert_command(
+        self.packer, cam, hud.ldw, hud.steer_required, lane_lines=hud.override_lane_lines))
 
     # send steering command
     can_sends.append(mazdacan.create_steering_control(self.packer, self.CP,

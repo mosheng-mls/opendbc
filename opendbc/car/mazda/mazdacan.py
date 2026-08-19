@@ -62,12 +62,15 @@ def create_steering_control(packer, CP, frame, apply_torque, lkas):
   return packer.make_can_msg("CAM_LKAS", 0, values)
 
 
-def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool):
+def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool,
+                         lane_lines: int | None = None):
   """Pack CAM_LANEINFO (0x440). Display-only vs EPS: Safety does not inspect this payload.
 
-  LANE_LINES / LINE_* are copied from OEM FSC cam_msg (HUD-BRIDGE-001: do not invent).
-  `ldw` is accepted for API compatibility but is not packed (LDW_WARN_* stay 0;
-  upstream TODO: left LDW does not work). Hands bits come from HudBridge policy.
+  LINE_* / reserved bits are copied from OEM FSC cam_msg.
+  LANE_LINES: HudBridge may override (HUD-BRIDGE-002 actual-control graphic).
+  If lane_lines is None, copy FSC (legacy). Do not pack TJA (unproven).
+  `ldw` is accepted for API compatibility but is not packed (LDW_WARN_* stay 0).
+  Hands bits come from HudBridge policy.
   """
   values = {s: cam_msg[s] for s in [
     "LINE_VISIBLE",
@@ -80,6 +83,8 @@ def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool)
     "S1",
     "S1_HBEAM",
   ]}
+  if lane_lines is not None:
+    values["LANE_LINES"] = int(lane_lines)
   values.update({
     "HANDS_WARN_3_BITS": 0b111 if steer_required else 0,
     "HANDS_ON_STEER_WARN": steer_required,

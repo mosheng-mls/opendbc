@@ -6,14 +6,21 @@ Safety / Panda / STEER_MAX / ICBM / 0x243 LKAS_REQUEST are out of scope.
 This module only decides HUD *display* bits that Safety already allows on 0x440
 without inspecting payload (mazda_tx_hook does not parse 0x440).
 
-Lane-line overrides are not applied in this foundation: LANE_LINES is copied
-from OEM FSC by the packer. Do not invent HUD graphics the OEM does not have.
+HUD-BRIDGE-002: C4-engaged graphic is LANE_LINES=2 driven by MazidControlEngagement
+(CarControl.latActive). Perception / ACC set speed must not light that graphic.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from opendbc.car import structs
+from opendbc.car.mazda.control_engagement import (
+  ControlMode,
+  EngagementInputs,
+  LANE_LINES_ACTIVE,
+  LANE_LINES_STANDBY,
+  MazidControlEngagement,
+)
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 GearShifter = structs.CarState.GearShifter
@@ -21,96 +28,129 @@ GearShifter = structs.CarState.GearShifter
 # HUD TX is 2 Hz (carcontroller frame % 50). Three ticks ≈ 1.5 s.
 MIN_WARN_TICKS = 3
 
-_PARK_REVERSE = (GearShifter.park, GearShifter.reverse)
-
 
 @dataclass(frozen=True)
 class HudInputs:
   lat_active: bool = False
+  enabled: bool = False
   visual_alert: int = VisualAlert.none
   gear: int = GearShifter.drive
   standstill: bool = False
   lkas_allowed_speed: bool = True
   steer_fault_temporary: bool = False
+  steer_fault_permanent: bool = False
   oem_hands_on: bool = False
+  cruise_available: bool = False
   cruise_enabled: bool = False
+  v_cruise_kph: float = 0.0
+  hud_set_speed_kph: float = 0.0
+  fsc_lane_lines: int = 1
   left_lane_visible: bool = False
   right_lane_visible: bool = False
+  actuators_torque: float = 0.0
+  steering_pressed: bool = False
+  brake_pressed: bool = False
+  cancel: bool = False
 
 
 @dataclass(frozen=True)
 class HudOutput:
   steer_required: bool
   ldw: bool
-  # Foundation: packer always copies OEM LANE_LINES. Exposed for tests / future.
   override_lane_lines: int | None
   reason: str
-  priority: str  # P0 / P1 / P2 / P3 / NONE
+  priority: str  # P0 / P1 / P2 / P3 / P4 / NONE
+  control_mode: str
+  lateral_engaged: bool
+  oem_acc_active: bool
 
 
 class MazidHudBridge:
-  """Stateful HUD policy: priority, debounce, OEM coexistence."""
+  """Stateful HUD policy: engagement → OEM graphic, priority, debounce, coexistence."""
 
   def __init__(self, min_warn_ticks: int = MIN_WARN_TICKS):
     self.min_warn_ticks = min_warn_ticks
     self._warn_hold = 0
+    self.engagement = MazidControlEngagement()
 
   def update(self, inp: HudInputs) -> HudOutput:
     ldw = inp.visual_alert == VisualAlert.ldw
+    eng = self.engagement.update(EngagementInputs(
+      lat_active=inp.lat_active,
+      enabled=inp.enabled,
+      cruise_available=inp.cruise_available,
+      cruise_enabled=inp.cruise_enabled,
+      v_cruise_kph=inp.v_cruise_kph,
+      hud_set_speed_kph=inp.hud_set_speed_kph,
+      fsc_lane_lines=inp.fsc_lane_lines,
+      left_lane_visible=inp.left_lane_visible,
+      right_lane_visible=inp.right_lane_visible,
+      actuators_torque=inp.actuators_torque,
+      steering_pressed=inp.steering_pressed,
+      visual_alert=inp.visual_alert,
+      gear=inp.gear,
+      standstill=inp.standstill,
+      lkas_allowed_speed=inp.lkas_allowed_speed,
+      steer_fault_temporary=inp.steer_fault_temporary,
+      steer_fault_permanent=inp.steer_fault_permanent,
+      brake_pressed=inp.brake_pressed,
+      cancel=inp.cancel,
+    ))
 
-    # P0: takeover / steer-capability (same OEM HUD bits as hands-on).
-    # Both map to VisualAlert.steerRequired today; distinguish parked
-    # LKAS_BLOCK overlay (steerFaultTemporary @ standstill) from on-road warn.
-    c4_warn = bool(inp.visual_alert == VisualAlert.steerRequired and inp.lkas_allowed_speed)
-    parked_like = inp.standstill or inp.gear in _PARK_REVERSE
-    suppress_c4 = parked_like and inp.steer_fault_temporary and not inp.lat_active
-    if suppress_c4:
-      c4_warn = False
-
-    if parked_like and not inp.lat_active:
-      # TEST 6: no false "assist active" HUD while parked / reverse.
-      # We do not override LANE_LINES, so this only gates C4 hands bits.
-      pass
-
-    # TEST 5: OEM hands-on is not wiped. OR, never NAND.
+    # P0 takeover bits: C4 steerRequired OR OEM hands. Never NAND OEM.
+    c4_warn = eng.mode == ControlMode.TAKEOVER_REQUIRED
     want_warn = c4_warn or inp.oem_hands_on
-
     if want_warn:
       self._warn_hold = self.min_warn_ticks
     steer_required = want_warn or self._warn_hold > 0
     if not want_warn and self._warn_hold > 0:
       self._warn_hold -= 1
 
-    if steer_required and (c4_warn or inp.oem_hands_on or self._warn_hold > 0):
-      if inp.lat_active and c4_warn:
-        priority = "P0"
-        reason = "steer_capability_or_takeover"
-      elif inp.oem_hands_on and not c4_warn:
-        priority = "P0"
-        reason = "oem_hands_priority"
-      elif suppress_c4 and inp.oem_hands_on:
-        priority = "P0"
-        reason = "oem_hands_priority"
-      else:
-        priority = "P1"
-        reason = "hands_or_hold"
-    elif inp.lat_active:
-      priority = "P2"
-      reason = "lat_active_copy_oem_lanes"
+    # C4 engaged graphic only when engagement says so. Takeover / unavail /
+    # standby / OEM-ACC-only / off all use LANE_LINES_STANDBY so FSC dual-lines
+    # cannot look like 'C4 already took over'.
+    if eng.lateral_engaged and not steer_required:
+      override_lane_lines = LANE_LINES_ACTIVE
     else:
-      priority = "P3"
-      reason = "idle_copy_oem_lanes"
+      override_lane_lines = LANE_LINES_STANDBY
 
-    # cruise_enabled is accepted so callers can share Vehicle State later.
-    # This foundation must not pack ACC into 0x440 (TEST 7).
-    _ = inp.cruise_enabled
-    _ = inp.left_lane_visible
-    _ = inp.right_lane_visible
+    if steer_required:
+      if c4_warn or inp.oem_hands_on or self._warn_hold > 0:
+        if inp.oem_hands_on and not c4_warn:
+          priority = "P0"
+          reason = "oem_hands_priority"
+        elif c4_warn:
+          priority = "P0"
+          reason = eng.reason
+        else:
+          priority = "P1"
+          reason = "hands_or_hold"
+      else:
+        priority = "P0"
+        reason = "hands_or_hold"
+    elif eng.mode == ControlMode.TEMP_UNAVAILABLE:
+      priority = "P1"
+      reason = eng.reason
+    elif eng.lateral_engaged:
+      priority = "P2"
+      reason = eng.reason
+    elif eng.mode == ControlMode.OEM_LONGITUDINAL_ACTIVE:
+      priority = "P3"
+      reason = eng.reason
+    elif eng.mode == ControlMode.STANDBY:
+      priority = "P3"
+      reason = eng.reason
+    else:
+      priority = "P4"
+      reason = eng.reason
 
     return HudOutput(
       steer_required=steer_required,
       ldw=ldw,
-      override_lane_lines=None,
+      override_lane_lines=override_lane_lines,
       reason=reason,
       priority=priority,
+      control_mode=eng.mode,
+      lateral_engaged=eng.lateral_engaged,
+      oem_acc_active=eng.oem_acc_active,
     )
