@@ -3,7 +3,7 @@ from opendbc.car import Bus, structs
 from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
-from opendbc.car.mazda.icbm import MazdaIcbmController
+from opendbc.car.mazda.icbm import MazdaIcbmController, persistent_cruise_target_ms
 from opendbc.car.mazda.values import CarControllerParams, Buttons
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
@@ -45,14 +45,15 @@ class CarController(CarControllerBase):
         # Send Resume button when planner wants car to move
         can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
       else:
-        # Mazid ICBM: SET+/SET− so stock ACC tracks planner target (hudControl.setSpeed)
+        # Mazid ICBM: SET+/SET− only to match persistent cruise set (vCruise),
+        # never hudControl.setSpeed / planner follow speed (RC1-ACC-001).
         if self.frame % 10 == 0:
           button = self.icbm.update(
             self.frame,
             enabled=CC.enabled,
             cruise_enabled=CS.out.cruiseState.enabled,
             cruise_speed_ms=float(CS.out.cruiseState.speed),
-            target_speed_ms=float(CC.hudControl.setSpeed),
+            target_speed_ms=persistent_cruise_target_ms(float(CS.out.vCruise)),
           )
           if button is not None:
             can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, button))
