@@ -87,7 +87,7 @@ class TestMazdaHudBridge(unittest.TestCase):
     self.assertNotEqual(out.priority, "P2")
     self.assertFalse(out.lateral_engaged)
     self.assertEqual(out.override_lane_lines, LANE_LINES_STANDBY)
-    self.assertEqual(out.control_mode, ControlMode.STANDBY)
+    self.assertEqual(out.control_mode, ControlMode.NO_ROAD)
 
   def test2_lat_active_true_is_stable_copy_oem_lanes(self):
     b = MazidHudBridge()
@@ -227,10 +227,10 @@ class TestHudBridge002Engagement(unittest.TestCase):
     self.assertFalse(out.lateral_engaged)
     self.assertEqual(out.override_lane_lines, LANE_LINES_STANDBY)
 
-  def test3_ready_without_control_is_standby(self):
+  def test3_ready_without_control_is_not_active(self):
     out = MazidHudBridge().update(HudInputs(
       lat_active=False, enabled=True, cruise_available=True))
-    self.assertEqual(out.control_mode, ControlMode.STANDBY)
+    self.assertEqual(out.control_mode, ControlMode.NO_ROAD)
     self.assertFalse(out.lateral_engaged)
 
   def test4_lat_active_control_path_is_lateral_active(self):
@@ -285,8 +285,9 @@ class TestHudBridge002Engagement(unittest.TestCase):
     b = MazidHudBridge()
     b.update(HudInputs(lat_active=True))
     out = b.update(HudInputs(lat_active=False, enabled=True))
-    self.assertEqual(out.control_mode, ControlMode.STANDBY)
+    self.assertNotEqual(out.control_mode, ControlMode.LATERAL_ACTIVE)
     self.assertFalse(out.lateral_engaged)
+    self.assertEqual(out.override_lane_lines, LANE_LINES_STANDBY)
 
   def test_rc_test_01_engagement_replay(self):
     if not os.path.isfile(SERIES):
@@ -318,6 +319,7 @@ class TestHudBridge002Engagement(unittest.TestCase):
     # First latActive in RC_TEST_01 is MADS (ss_enabled false, no ACC).
     self.assertEqual(str(first_lat[2]), "False")
     self.assertEqual(str(first_lat[3]), "False")
+    self.assertIn("23:34:38", str(first_lat[1]))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ _PARK_REVERSE = (GearShifter.park, GearShifter.reverse)
 
 class ControlMode:
   OFF = "OFF"
+  NO_ROAD = "NO_ROAD"
   STANDBY = "STANDBY"
   LATERAL_ACTIVE = "LATERAL_ACTIVE"
   OEM_LONGITUDINAL_ACTIVE = "OEM_LONGITUDINAL_ACTIVE"
@@ -148,9 +149,12 @@ class MazidControlEngagement:
     elif oem_acc:
       mode = ControlMode.OEM_LONGITUDINAL_ACTIVE
       reason = "oem_acc_only"
-    elif not parked:
+    elif inp.left_lane_visible or inp.right_lane_visible:
       mode = ControlMode.STANDBY
-      reason = "onroad_not_lat_active"
+      reason = "c4_road_seen_not_lat_active"
+    elif not parked:
+      mode = ControlMode.NO_ROAD
+      reason = "c4_no_road"
     else:
       mode = ControlMode.OFF
       reason = "off"

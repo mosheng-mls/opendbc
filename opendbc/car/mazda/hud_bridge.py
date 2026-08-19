@@ -58,11 +58,14 @@ class HudOutput:
   steer_required: bool
   ldw: bool
   override_lane_lines: int | None
+  line_visible: int | None
+  line_not_visible: int | None
   reason: str
   priority: str  # P0 / P1 / P2 / P3 / P4 / NONE
   control_mode: str
   lateral_engaged: bool
   oem_acc_active: bool
+  road_seen: bool
 
 
 class MazidHudBridge:
@@ -107,12 +110,19 @@ class MazidHudBridge:
       self._warn_hold -= 1
 
     # C4 engaged graphic only when engagement says so. Takeover / unavail /
-    # standby / OEM-ACC-only / off all use LANE_LINES_STANDBY so FSC dual-lines
-    # cannot look like 'C4 already took over'.
+    # standby / OEM-ACC-only / no-road / off all use LANE_LINES_STANDBY so FSC
+    # dual-lines cannot look like 'C4 already took over'.
+    # ROAD_SEEN is C4 modelV2 (left/rightLaneVisible), never FSC.
+    road_seen = bool(inp.left_lane_visible or inp.right_lane_visible)
     if eng.lateral_engaged and not steer_required:
       override_lane_lines = LANE_LINES_ACTIVE
+      line_visible, line_not_visible = 1, 0
     else:
       override_lane_lines = LANE_LINES_STANDBY
+      if road_seen:
+        line_visible, line_not_visible = 1, 0
+      else:
+        line_visible, line_not_visible = 0, 1
 
     if steer_required:
       if c4_warn or inp.oem_hands_on or self._warn_hold > 0:
@@ -140,6 +150,9 @@ class MazidHudBridge:
     elif eng.mode == ControlMode.STANDBY:
       priority = "P3"
       reason = eng.reason
+    elif eng.mode == ControlMode.NO_ROAD:
+      priority = "P4"
+      reason = eng.reason
     else:
       priority = "P4"
       reason = eng.reason
@@ -148,9 +161,12 @@ class MazidHudBridge:
       steer_required=steer_required,
       ldw=ldw,
       override_lane_lines=override_lane_lines,
+      line_visible=line_visible,
+      line_not_visible=line_not_visible,
       reason=reason,
       priority=priority,
       control_mode=eng.mode,
       lateral_engaged=eng.lateral_engaged,
       oem_acc_active=eng.oem_acc_active,
+      road_seen=road_seen,
     )

@@ -62,33 +62,65 @@ def create_steering_control(packer, CP, frame, apply_torque, lkas):
   return packer.make_can_msg("CAM_LKAS", 0, values)
 
 
+# Copied from FSC. Do not invent TJA / ERR_BIT / LDW_WARN_* / undocumented bits.
+_CAM_LANEINFO_COPY = (
+  "LINE_VISIBLE",
+  "LINE_NOT_VISIBLE",
+  "LANE_LINES",
+  "BIT1",
+  "BIT2",
+  "BIT3",
+  "NO_ERR_BIT",
+  "S1",
+  "S1_HBEAM",
+)
+
+
 def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool,
-                         lane_lines: int | None = None):
+                         lane_lines: int | None = None,
+                         line_visible: int | None = None,
+                         line_not_visible: int | None = None,
+                         hands_on: bool | None = None,
+                         hands_on_2: bool | None = None,
+                         hands_warn_3: int | None = None,
+                         copy_oem: bool = False):
   """Pack CAM_LANEINFO (0x440). Display-only vs EPS: Safety does not inspect this payload.
 
-  LINE_* / reserved bits are copied from OEM FSC cam_msg.
+  LINE_* / reserved bits are copied from OEM FSC cam_msg unless a DISPLAY_ONLY
+  override is supplied (HUD-PROBE-003 gallery / C4 road-seen).
   LANE_LINES: HudBridge may override (HUD-BRIDGE-002 actual-control graphic).
   If lane_lines is None, copy FSC (legacy). Do not pack TJA (unproven).
   `ldw` is accepted for API compatibility but is not packed (LDW_WARN_* stay 0).
-  Hands bits come from HudBridge policy.
+  Hands bits come from HudBridge policy unless independently overridden.
+  None-defaults keep HUD-BRIDGE-001/002 packing.
   """
-  values = {s: cam_msg[s] for s in [
-    "LINE_VISIBLE",
-    "LINE_NOT_VISIBLE",
-    "LANE_LINES",
-    "BIT1",
-    "BIT2",
-    "BIT3",
-    "NO_ERR_BIT",
-    "S1",
-    "S1_HBEAM",
-  ]}
+  values = {s: cam_msg[s] for s in _CAM_LANEINFO_COPY}
+  if copy_oem:
+    values["HANDS_WARN_3_BITS"] = int(cam_msg.get("HANDS_WARN_3_BITS", 0) or 0)
+    values["HANDS_ON_STEER_WARN"] = bool(cam_msg.get("HANDS_ON_STEER_WARN", 0))
+    values["HANDS_ON_STEER_WARN_2"] = bool(cam_msg.get("HANDS_ON_STEER_WARN_2", 0))
+    values["LDW_WARN_LL"] = 0
+    values["LDW_WARN_RL"] = 0
+    _ = ldw
+    return packer.make_can_msg("CAM_LANEINFO", 0, values)
+
   if lane_lines is not None:
     values["LANE_LINES"] = int(lane_lines)
+  if line_visible is not None:
+    values["LINE_VISIBLE"] = int(line_visible)
+  if line_not_visible is not None:
+    values["LINE_NOT_VISIBLE"] = int(line_not_visible)
+
+  h1 = bool(steer_required) if hands_on is None else bool(hands_on)
+  h2 = bool(steer_required) if hands_on_2 is None else bool(hands_on_2)
+  if hands_warn_3 is None:
+    w3 = 0b111 if (h1 or h2) else 0
+  else:
+    w3 = int(hands_warn_3)
   values.update({
-    "HANDS_WARN_3_BITS": 0b111 if steer_required else 0,
-    "HANDS_ON_STEER_WARN": steer_required,
-    "HANDS_ON_STEER_WARN_2": steer_required,
+    "HANDS_WARN_3_BITS": w3,
+    "HANDS_ON_STEER_WARN": h1,
+    "HANDS_ON_STEER_WARN_2": h2,
     "LDW_WARN_LL": 0,
     "LDW_WARN_RL": 0,
   })

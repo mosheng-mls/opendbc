@@ -4,6 +4,7 @@ from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
 from opendbc.car.mazda.hud_bridge import HudInputs, MazidHudBridge
+from opendbc.car.mazda.hud_probe import MazidHudProbe, probe_enabled
 from opendbc.car.mazda.icbm import MazdaIcbmController, persistent_cruise_target_ms
 from opendbc.car.mazda.values import CarControllerParams, Buttons
 
@@ -16,6 +17,7 @@ class CarController(CarControllerBase):
     self.brake_counter = 0
     self.icbm = MazdaIcbmController()
     self.hud_bridge = MazidHudBridge()
+    self.hud_probe = MazidHudProbe() if probe_enabled() else None
 
   def update(self, CC, CS, now_nanos):
     can_sends = []
@@ -64,30 +66,65 @@ class CarController(CarControllerBase):
     # DISPLAY_ONLY 0x440 path. Does not change 0x243 torque or ICBM buttons.
     if self.frame % 50 == 0:
       cam = CS.cam_laneinfo or {}
-      hud = self.hud_bridge.update(HudInputs(
-        lat_active=bool(CC.latActive),
-        enabled=bool(CC.enabled),
-        visual_alert=CC.hudControl.visualAlert,
-        gear=CS.out.gearShifter,
-        standstill=bool(CS.out.standstill),
-        lkas_allowed_speed=bool(CS.lkas_allowed_speed),
-        steer_fault_temporary=bool(CS.out.steerFaultTemporary),
-        steer_fault_permanent=bool(CS.out.steerFaultPermanent),
-        oem_hands_on=bool(cam.get("HANDS_ON_STEER_WARN", 0)),
-        cruise_available=bool(CS.out.cruiseState.available),
-        cruise_enabled=bool(CS.out.cruiseState.enabled),
-        v_cruise_kph=float(CS.out.vCruise),
-        hud_set_speed_kph=float(CC.hudControl.setSpeed),
-        fsc_lane_lines=int(cam.get("LANE_LINES", 1) or 1),
-        left_lane_visible=bool(CC.hudControl.leftLaneVisible),
-        right_lane_visible=bool(CC.hudControl.rightLaneVisible),
-        actuators_torque=float(CC.actuators.torque),
-        steering_pressed=bool(CS.out.steeringPressed),
-        brake_pressed=bool(CS.out.brakePressed),
-        cancel=bool(CC.cruiseControl.cancel),
-      ))
-      can_sends.append(mazdacan.create_alert_command(
-        self.packer, cam, hud.ldw, hud.steer_required, lane_lines=hud.override_lane_lines))
+      probe_tick = None
+      if self.hud_probe is not None:
+        probe_tick = self.hud_probe.update(
+          standstill=bool(CS.out.standstill),
+          v_ego=float(CS.out.vEgo),
+          gear=CS.out.gearShifter,
+          steer_fault_permanent=bool(CS.out.steerFaultPermanent),
+          now_ns=int(now_nanos),
+        )
+      if probe_tick is not None and probe_tick.static and probe_tick.display is not None:
+        d = probe_tick.display
+        msg = mazdacan.create_alert_command(
+          self.packer, cam, False, False,
+          lane_lines=None if d.copy_oem else d.lane_lines,
+          line_visible=None if d.copy_oem else d.line_visible,
+          line_not_visible=None if d.copy_oem else d.line_not_visible,
+          hands_on=None if d.copy_oem else d.hands_on,
+          hands_on_2=None if d.copy_oem else d.hands_on_2,
+          hands_warn_3=None if d.copy_oem else d.hands_warn_3,
+          copy_oem=d.copy_oem,
+        )
+        self.hud_probe.log_tx(
+          gid=probe_tick.gid,
+          payload_hex=msg[1].hex(),
+          v_ego=float(CS.out.vEgo),
+          gear=int(CS.out.gearShifter),
+          standstill=bool(CS.out.standstill),
+          now_ns=int(now_nanos),
+        )
+        can_sends.append(msg)
+      else:
+        hud = self.hud_bridge.update(HudInputs(
+          lat_active=bool(CC.latActive),
+          enabled=bool(CC.enabled),
+          visual_alert=CC.hudControl.visualAlert,
+          gear=CS.out.gearShifter,
+          standstill=bool(CS.out.standstill),
+          lkas_allowed_speed=bool(CS.lkas_allowed_speed),
+          steer_fault_temporary=bool(CS.out.steerFaultTemporary),
+          steer_fault_permanent=bool(CS.out.steerFaultPermanent),
+          oem_hands_on=bool(cam.get("HANDS_ON_STEER_WARN", 0)),
+          cruise_available=bool(CS.out.cruiseState.available),
+          cruise_enabled=bool(CS.out.cruiseState.enabled),
+          v_cruise_kph=float(CS.out.vCruise),
+          hud_set_speed_kph=float(CC.hudControl.setSpeed),
+          fsc_lane_lines=int(cam.get("LANE_LINES", 1) or 1),
+          left_lane_visible=bool(CC.hudControl.leftLaneVisible),
+          right_lane_visible=bool(CC.hudControl.rightLaneVisible),
+          actuators_torque=float(CC.actuators.torque),
+          steering_pressed=bool(CS.out.steeringPressed),
+          brake_pressed=bool(CS.out.brakePressed),
+          cancel=bool(CC.cruiseControl.cancel),
+        ))
+        can_sends.append(mazdacan.create_alert_command(
+          self.packer, cam, hud.ldw, hud.steer_required,
+          lane_lines=hud.override_lane_lines,
+          line_visible=hud.line_visible,
+          line_not_visible=hud.line_not_visible,
+        ))
 
     # send steering command
     can_sends.append(mazdacan.create_steering_control(self.packer, self.CP,
