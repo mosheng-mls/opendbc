@@ -9,9 +9,8 @@ from opendbc.safety.tests.common import CANPackerSafety, make_msg
 
 
 class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTest):
-
-  TX_MSGS = [[0x243, 0], [0x09d, 0], [0x440, 0]]
-  STANDSTILL_THRESHOLD = .1
+  TX_MSGS = [[0x243, 0], [0x09D, 0], [0x440, 0]]
+  STANDSTILL_THRESHOLD = 0.1
   RELAY_MALFUNCTION_ADDRS = {0: (0x243, 0x440)}
   FWD_BLACKLISTED_ADDRS = {2: [0x243, 0x440]}
 
@@ -81,6 +80,34 @@ class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTes
     self.assertTrue(self._tx(self._button_msg(cancel=True)))
     self.assertTrue(self._tx(self._button_msg(resume=True)))
 
+  def test_direct_longitudinal_candidates_are_always_blocked(self):
+    # Full-DLC candidate payloads, including a complete ISO-TP single-frame
+    # UDS diagnostic-session request on the radar address.
+    candidate_payloads = {
+      0x21B: b"\x00\x10\x00\x20\x04\x00\x01\x55",  # CRZ_INFO / ACCEL_CMD candidate
+      0x21C: b"\x08\x00\x06\x00\x01\x01\x00\x5a",  # CRZ_CTRL candidate
+      0x764: b"\x02\x10\x03\x00\x00\x00\x00\x00",  # UDS DiagnosticSessionControl(extended)
+    }
+
+    for addr, dat in candidate_payloads.items():
+      self.assertEqual(len(dat), 8)
+      for bus in range(4):
+        for controls_allowed in (False, True):
+          with self.subTest(addr=hex(addr), bus=bus, controls_allowed=controls_allowed):
+            self.safety.set_controls_allowed(controls_allowed)
+            self.assertFalse(self._tx(make_msg(bus, addr, dat=dat)))
+
+  def test_legal_tx_boundary_is_preserved(self):
+    # Mazda TX remains limited to LKAS, cruise buttons, and HUD.
+    self.assertEqual(self.TX_MSGS, [[0x243, 0], [0x09D, 0], [0x440, 0]])
+    self.safety.set_controls_allowed(True)
+    self.safety.set_desired_torque_last(0)
+    self.safety.set_rt_torque_last(0)
+    self.safety.set_torque_driver(0, 0)
+    self.assertTrue(self._tx(self._torque_cmd_msg(0)))  # 0x243 LKAS
+    self.assertTrue(self._tx(self._button_msg(resume=True)))  # 0x09D CRZ_BTNS
+    self.assertTrue(self._tx(make_msg(0, 0x440)))  # CAM_LANEINFO
+
   def _acc_main_msg(self, available, active=False):
     values = {"CRZ_AVAILABLE": int(available), "CRZ_ACTIVE": int(active)}
     return self.packer.make_can_msg_safety("CRZ_CTRL", 0, values)
@@ -106,7 +133,6 @@ class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTes
     self.assertFalse(self.safety.get_controls_allowed())
     self.assertTrue(self.safety.get_controls_allowed_lateral())
     self.assertTrue(self._tx(self._torque_cmd_msg(10)))
-
 
 
 class TestMazdaIgnition(unittest.TestCase):
