@@ -4,7 +4,7 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.mazda.carcontroller import CarController
 from opendbc.car.mazda.carstate import CarState
-from opendbc.car.mazda.values import CAR, LKAS_LIMITS
+from opendbc.car.mazda.values import CAR, LKAS_LIMITS, LOW_DEMAND_P_TORQUE_CAP
 
 
 class CarInterface(CarInterfaceBase):
@@ -33,3 +33,11 @@ class CarInterface(CarInterfaceBase):
     ret.centerToFront = ret.wheelbase * 0.41
 
     return ret
+
+  def get_low_demand_p_torque_cap(self) -> float | None:
+    # MAZDA_3_2019 reuses GEN1 MAZDA_3 body specs and CX9 torque substitute.
+    # Protocol reuse is not a free pass on lateral gains: low-speed KP * leftover
+    # steer angle pegs reverse torque through zero (RC_TEST_01 RC1-LAT-001).
+    if self.CP.carFingerprint in (CAR.MAZDA_3, CAR.MAZDA_3_2019):
+      return LOW_DEMAND_P_TORQUE_CAP
+    return None

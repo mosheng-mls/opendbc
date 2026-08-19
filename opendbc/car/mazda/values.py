@@ -90,6 +90,12 @@ class LKAS_LIMITS:
   ENABLE_SPEED = 52     # kph
 
 
+# RC1-LAT-001: max |P| (normalized torque) when |desired curvature| is low.
+# Does not change STEER_MAX / DELTA_UP / DELTA_DOWN. High-curvature demand
+# bypasses this cap inside LatControlTorque so LAT-002 authority stays.
+LOW_DEMAND_P_TORQUE_CAP = 0.45
+
+
 class Buttons:
   NONE = 0
   SET_PLUS = 1
