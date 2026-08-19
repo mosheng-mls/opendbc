@@ -17,6 +17,12 @@ class CarInterface(CarInterfaceBase):
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.mazda)]
     ret.radarUnavailable = True
 
+    # LONG-007: this Mazda3's OEM ACC exits near 30 km/h and has no verified
+    # stop-and-go state to resume. Keep generic Mazda auto-resume available for
+    # platforms that support it, but fail closed on the 2019 Mazda3 BM.
+    if candidate == CAR.MAZDA_3_2019:
+      ret.autoResumeSng = False
+
     # Driving MVP (DRIVE-MVP-001): MAZDA_3_2019 is a first-class drivable platform.
     # Do not reuse CX5_2022 as a live identity substitute — only share capability flags here.
     ret.dashcamOnly = candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_CX9_2021, CAR.MAZDA_3_2019)
