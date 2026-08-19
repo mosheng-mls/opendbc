@@ -63,6 +63,12 @@ def create_steering_control(packer, CP, frame, apply_torque, lkas):
 
 
 def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool):
+  """Pack CAM_LANEINFO (0x440). Display-only vs EPS: Safety does not inspect this payload.
+
+  LANE_LINES / LINE_* are copied from OEM FSC cam_msg (HUD-BRIDGE-001: do not invent).
+  `ldw` is accepted for API compatibility but is not packed (LDW_WARN_* stay 0;
+  upstream TODO: left LDW does not work). Hands bits come from HudBridge policy.
+  """
   values = {s: cam_msg[s] for s in [
     "LINE_VISIBLE",
     "LINE_NOT_VISIBLE",
@@ -75,16 +81,13 @@ def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool)
     "S1_HBEAM",
   ]}
   values.update({
-    # TODO: what's the difference between all these? do we need to send all?
     "HANDS_WARN_3_BITS": 0b111 if steer_required else 0,
     "HANDS_ON_STEER_WARN": steer_required,
     "HANDS_ON_STEER_WARN_2": steer_required,
-
-    # TODO: right lane works, left doesn't
-    # TODO: need to do something about L/R
     "LDW_WARN_LL": 0,
     "LDW_WARN_RL": 0,
   })
+  _ = ldw  # not packed; see HUD_CAN_FIELD_MAP
   return packer.make_can_msg("CAM_LANEINFO", 0, values)
 
 

@@ -3,10 +3,9 @@ from opendbc.car import Bus, structs
 from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
+from opendbc.car.mazda.hud_bridge import HudInputs, MazidHudBridge
 from opendbc.car.mazda.icbm import MazdaIcbmController, persistent_cruise_target_ms
 from opendbc.car.mazda.values import CarControllerParams, Buttons
-
-VisualAlert = structs.CarControl.HUDControl.VisualAlert
 
 
 class CarController(CarControllerBase):
@@ -16,6 +15,7 @@ class CarController(CarControllerBase):
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.brake_counter = 0
     self.icbm = MazdaIcbmController()
+    self.hud_bridge = MazidHudBridge()
 
   def update(self, CC, CS, now_nanos):
     can_sends = []
@@ -60,13 +60,23 @@ class CarController(CarControllerBase):
 
     self.apply_torque_last = apply_torque
 
-    # send HUD alerts
+    # send HUD alerts (2 Hz). Policy in HudBridge; packing in mazdacan.
+    # DISPLAY_ONLY 0x440 path. Does not change 0x243 torque or ICBM buttons.
     if self.frame % 50 == 0:
-      ldw = CC.hudControl.visualAlert == VisualAlert.ldw
-      steer_required = CC.hudControl.visualAlert == VisualAlert.steerRequired
-      # TODO: find a way to silence audible warnings so we can add more hud alerts
-      steer_required = steer_required and CS.lkas_allowed_speed
-      can_sends.append(mazdacan.create_alert_command(self.packer, CS.cam_laneinfo, ldw, steer_required))
+      cam = CS.cam_laneinfo or {}
+      hud = self.hud_bridge.update(HudInputs(
+        lat_active=bool(CC.latActive),
+        visual_alert=CC.hudControl.visualAlert,
+        gear=CS.out.gearShifter,
+        standstill=bool(CS.out.standstill),
+        lkas_allowed_speed=bool(CS.lkas_allowed_speed),
+        steer_fault_temporary=bool(CS.out.steerFaultTemporary),
+        oem_hands_on=bool(cam.get("HANDS_ON_STEER_WARN", 0)),
+        cruise_enabled=bool(CS.out.cruiseState.enabled),
+        left_lane_visible=bool(CC.hudControl.leftLaneVisible),
+        right_lane_visible=bool(CC.hudControl.rightLaneVisible),
+      ))
+      can_sends.append(mazdacan.create_alert_command(self.packer, cam, hud.ldw, hud.steer_required))
 
     # send steering command
     can_sends.append(mazdacan.create_steering_control(self.packer, self.CP,
