@@ -5,7 +5,7 @@ from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.mazda.carcontroller import CarController
 from opendbc.car.mazda.carstate import CarState
 from opendbc.car.mazda.radar_interface import RadarInterface
-from opendbc.car.mazda.values import CAR, LKAS_LIMITS, LOW_DEMAND_P_TORQUE_CAP
+from opendbc.car.mazda.values import CAR, LKAS_LIMITS, LOW_DEMAND_P_TORQUE_CAP, MazdaSafetyFlags
 
 
 class CarInterface(CarInterfaceBase):
@@ -18,6 +18,19 @@ class CarInterface(CarInterfaceBase):
     ret.brand = "mazda"
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.mazda)]
     ret.radarUnavailable = True
+
+    if candidate == CAR.MAZDA_3_2019:
+      ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.BM_LOW_SPEED_STEER.value
+
+    # Mazda3 BM vision-only longitudinal keeps the proven BM identity and
+    # lateral tune. The stock wheel/PCM state still owns engagement, while OP
+    # replaces only the acceleration command after the radar is silenced.
+    ret.alphaLongitudinalAvailable = candidate == CAR.MAZDA_3_2019
+    ret.openpilotLongitudinalControl = alpha_long and ret.alphaLongitudinalAvailable
+    if ret.openpilotLongitudinalControl:
+      ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.VISION_ONLY_RADAR.value
+      ret.pcmCruise = True
+      ret.longitudinalActuatorDelay = 0.30
 
     # LONG-007: this Mazda3's OEM ACC exits near 30 km/h and has no verified
     # stop-and-go state to resume. Keep generic Mazda auto-resume available for

@@ -135,6 +135,131 @@ class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTes
     self.assertTrue(self._tx(self._torque_cmd_msg(10)))
 
 
+class TestMazdaVisionOnlyRadarSafety(common.SafetyTestBase):
+  # Production BM mode combines bit 0 (low-speed steering) and bit 1
+  # (vision-only direct longitudinal). Tests must exercise the deployed value.
+  DEPLOYED_PARAM = 3
+  TX_MSGS = (
+    [[0x764, 0]] +
+    [[addr, bus] for bus in (0, 2) for addr in (0x21B, 0x21C, 0x499, 0x361, 0x362, 0x363, 0x364, 0x365, 0x366)]
+  )
+  PROGRAMMING = b"\x02\x10\x02\x00\x00\x00\x00\x00"
+  TESTER_PRESENT = b"\x02\x3E\x80\x00\x00\x00\x00\x00"
+  DEFAULT = b"\x02\x10\x01\x00\x00\x00\x00\x00"
+
+  def setUp(self):
+    self.packer = CANPackerSafety("mazda_2017")
+    self.safety = libsafety_py.libsafety
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, self.DEPLOYED_PARAM)
+    self.safety.init_tests()
+
+  def _enable_mads(self, mode=ALTERNATIVE_EXPERIENCE.ENABLE_MADS):
+    self.safety.set_alternative_experience(mode)
+    # sunnypilot's test shim separates storing and applying the setting;
+    # the selective Mazid safety shim applies it in set_alternative_experience.
+    if hasattr(self.safety, "mads_apply_alternative_experience"):
+      self.safety.mads_apply_alternative_experience(mode)
+
+  def _pedals_msg(self, *, acc_main=False, active=False, brake=False):
+    return self.packer.make_can_msg_safety("PEDALS", 0, {
+      "ACC_OFF": int(acc_main),
+      "ACC_ACTIVE": int(active),
+      "BRAKE_ON": int(brake),
+    })
+
+  @staticmethod
+  def _active_crz_info(bus, counter=0):
+    dat = bytearray(b"\x01\xff\xe2\x00\x06\x80\x00\x00")
+    dat[6] = counter & 0x0F
+    dat[7] = 0xFF - (sum(dat[:7]) & 0xFF)
+    return make_msg(bus, 0x21B, dat=bytes(dat))
+
+  @staticmethod
+  def _active_crz_ctrl(bus):
+    return make_msg(bus, 0x21C, dat=b"\x0a\x01\x0b\x20\x00\x00\x10\x00")
+
+  def test_exact_payload_policy(self):
+    for controls_allowed in (False, True):
+      self.safety.set_controls_allowed(controls_allowed)
+      self.assertTrue(self._tx(make_msg(0, 0x764, dat=self.TESTER_PRESENT)))
+      self.assertEqual(self._tx(make_msg(0, 0x764, dat=self.PROGRAMMING)), not controls_allowed)
+      self.assertEqual(self._tx(make_msg(0, 0x764, dat=self.DEFAULT)), not controls_allowed)
+
+  def test_wrong_bus_dlc_and_payload_are_blocked(self):
+    self.safety.set_controls_allowed(False)
+    for bus in (1, 2, 3):
+      for dat in (self.PROGRAMMING, self.TESTER_PRESENT, self.DEFAULT):
+        self.assertFalse(self._tx(make_msg(bus, 0x764, dat=dat)))
+
+    self.assertFalse(self._tx(make_msg(0, 0x764, dat=self.TESTER_PRESENT[:-1])))
+    invalid_payloads = (
+      b"\x02\x10\x03\x00\x00\x00\x00\x00",
+      b"\x02\x28\x83\x01\x00\x00\x00\x00",
+      b"\x02\x3E\x00\x00\x00\x00\x00\x00",
+      b"\x03\x10\x02\x00\x00\x00\x00\x00",
+    )
+    for dat in invalid_payloads:
+      self.assertFalse(self._tx(make_msg(0, 0x764, dat=dat)))
+
+  def test_single_bit_payload_mutations_are_blocked(self):
+    self.safety.set_controls_allowed(False)
+    for valid in (self.PROGRAMMING, self.TESTER_PRESENT, self.DEFAULT):
+      for bit in range(64):
+        mutated = bytearray(valid)
+        mutated[bit // 8] ^= 1 << (bit % 8)
+        self.assertFalse(self._tx(make_msg(0, 0x764, dat=bytes(mutated))))
+
+  def test_deployed_mode_accepts_only_valid_direct_frames(self):
+    self.safety.set_controls_allowed(True)
+    for bus in (0, 2):
+      self.assertTrue(self._tx(self._active_crz_info(bus)))
+      self.assertTrue(self._tx(self._active_crz_ctrl(bus)))
+
+    for bus in (0, 2):
+      self.assertFalse(self._tx(make_msg(bus, 0x21B, dat=b"\x00" * 8)))
+      self.assertFalse(self._tx(make_msg(bus, 0x21C, dat=b"\x00" * 8)))
+
+    for bus in (1, 3):
+      self.assertFalse(self._tx(self._active_crz_info(bus)))
+      self.assertFalse(self._tx(self._active_crz_ctrl(bus)))
+
+  def test_pedals_preserve_mads_brake_policy(self):
+    self._enable_mads()
+    self.assertTrue(self._rx(self._pedals_msg()))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+    self.assertTrue(self._rx(self._pedals_msg(acc_main=True)))
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    self.assertTrue(self._rx(self._pedals_msg(active=True)))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    # The stock PEDALS bits can both fall during braking. Longitudinal control
+    # must disengage, while MADS REMAIN_ACTIVE keeps lateral authority.
+    self.assertTrue(self._rx(self._pedals_msg(brake=True)))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    # A stable main-off state, unlike the brake transient, drops lateral.
+    self.assertTrue(self._rx(self._pedals_msg()))
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertTrue(self._rx(self._pedals_msg()))
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_default_mazda_mode_still_blocks_radar_diagnostics(self):
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, 0)
+    self.safety.init_tests()
+    for dat in (self.PROGRAMMING, self.TESTER_PRESENT, self.DEFAULT):
+      for bus in range(4):
+        for controls_allowed in (False, True):
+          self.safety.set_controls_allowed(controls_allowed)
+          self.assertFalse(self._tx(make_msg(bus, 0x764, dat=dat)))
+
+
 class TestMazdaIgnition(unittest.TestCase):
   TX_MSGS: list = []
 

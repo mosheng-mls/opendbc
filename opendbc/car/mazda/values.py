@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from enum import IntFlag
 
+import numpy as np
+
 from opendbc.car import Bus, CarSpecs, DbcDict, PlatformConfig, Platforms
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.structs import CarParams
@@ -13,7 +15,10 @@ Ecu = CarParams.Ecu
 # Steer torque limits
 
 class CarControllerParams:
-  STEER_MAX = 800                # theoretical max_steer 2047
+  STEER_MAX = 800                 # default Mazda limit; theoretical max 2047
+  STEER_MAX_BM = 1100             # BM low-speed/high-curvature candidate
+  STEER_MAX_SPEED_LOOKUP = ([0.0, 20.0 * CV.KPH_TO_MS, 35.0 * CV.KPH_TO_MS], [1100.0, 1100.0, 800.0])
+  STEER_MAX_CURVATURE_LOOKUP = ([0.025, 0.05], [0.0, 1.0])
   STEER_DELTA_UP = 10             # torque increase per refresh
   STEER_DELTA_DOWN = 25           # torque decrease per refresh
   STEER_DRIVER_ALLOWANCE = 15     # allowed driver torque before start limiting
@@ -23,6 +28,15 @@ class CarControllerParams:
 
   def __init__(self, CP):
     pass
+
+  @classmethod
+  def get_bm_steer_max(cls, v_ego: float, desired_curvature: float) -> int:
+    if not np.isfinite(v_ego) or not np.isfinite(desired_curvature):
+      return cls.STEER_MAX
+    speed_cap = float(np.interp(max(v_ego, 0.0), cls.STEER_MAX_SPEED_LOOKUP[0], cls.STEER_MAX_SPEED_LOOKUP[1]))
+    curve_weight = float(np.interp(abs(desired_curvature), cls.STEER_MAX_CURVATURE_LOOKUP[0],
+                                   cls.STEER_MAX_CURVATURE_LOOKUP[1]))
+    return int(round(cls.STEER_MAX + curve_weight * (speed_cap - cls.STEER_MAX)))
 
 
 @dataclass
@@ -40,6 +54,13 @@ class MazdaFlags(IntFlag):
   # Static flags
   # Gen 1 hardware: same CAN messages and same camera
   GEN1 = 1
+
+
+class MazdaSafetyFlags(IntFlag):
+  BM_LOW_SPEED_STEER = 1
+  # Independent opt-in for radar-session and direct-long frames. This must not
+  # alias the already deployed BM low-speed steering permission.
+  VISION_ONLY_RADAR = 2
 
 
 @dataclass

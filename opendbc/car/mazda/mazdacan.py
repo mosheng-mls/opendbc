@@ -1,4 +1,84 @@
+from opendbc.car.can_definitions import CanData
 from opendbc.car.mazda.values import Buttons, MazdaFlags
+
+
+# Mazda3 BM direct-long adapter. These byte layouts are isolated from the BM DBC on
+# purpose: the stock mazda_2017/BM dictionaries do not contain the 1 mm/s^2 CRZ_INFO
+# scaling used by the ZoomPilot candidate that successfully drove this BM vehicle.
+# Only ordinary cruise/follow is represented here; stop/hold/resume bits and synthetic
+# lead targets stay permanently clear in this first candidate.
+BM_CRZ_INFO_ADDR = 0x21B
+BM_CRZ_CTRL_ADDR = 0x21C
+
+BM_NO_TARGET_RADAR_STATIC = (0x499, bytes.fromhex("0008c00000000000"))
+BM_NO_TARGET_RADAR_TRACKS = (
+  (0x361, bytes.fromhex("fff7fefe1fc00080")),
+  (0x362, bytes.fromhex("fff7fefe1fc78c80")),
+  (0x363, bytes.fromhex("fff7fefe1fc00000")),
+  (0x364, bytes.fromhex("fff7fefe1fc00000")),
+  (0x365, bytes.fromhex("fff7fe7ffbff3fc0")),
+  (0x366, bytes.fromhex("fff7fe7ffbff3fc0")),
+)
+
+
+def bm_crz_info_checksum(dat: bytes) -> int:
+  """Return the stock 0x21B inverted checksum.
+
+  The stop bit is excluded by the Mazda radar checksum rule. This adapter never sets
+  that bit, but retaining the exact rule keeps the byte contract explicit.
+  """
+  return (0xFF - ((sum(dat[:7]) - (dat[5] & 0x04)) & 0xFF)) & 0xFF
+
+
+def create_bm_direct_acc_command(bus: int, counter: int, accel: float,
+                                 long_active: bool, acc_available: bool) -> CanData:
+  """Create ordinary-cruise CRZ_INFO (0x21B) without stop/hold/resume fields."""
+  dat = bytearray(8)
+  dat[0] = 0x01  # STATUS
+  dat[1] = 0xFF
+  dat[2] = 0xE0  # STATIC_1 = 0x7ff
+  dat[6] = counter & 0x0F
+
+  if long_active or acc_available:
+    # ZoomPilot's proven definition: 13-bit unsigned, factor 0.001, offset -4.096.
+    accel = max(-4.096, min(4.095, float(accel)))
+    raw_accel = int((accel + 4.096) * 1000.0 + 0.5)
+    dat[2] |= (raw_accel >> 11) & 0x03
+    dat[3] = (raw_accel >> 3) & 0xFF
+    dat[4] = ((raw_accel & 0x07) << 5) | (int(long_active) << 1) | 0x04
+    dat[5] = 0x80  # NEW_SIGNAL_7; STOPPING remains clear
+  else:
+    # Stock radar standby pattern with the MRCC main switch off: ACCEL_CMD raw 8190.
+    raw_accel = 0x1FFE
+    dat[2] |= (raw_accel >> 11) & 0x03
+    dat[3] = (raw_accel >> 3) & 0xFF
+    dat[4] = (raw_accel & 0x07) << 5
+
+  dat[7] = bm_crz_info_checksum(dat)
+  return CanData(BM_CRZ_INFO_ADDR, bytes(dat), bus)
+
+
+def create_bm_direct_crz_ctrl(bus: int, long_active: bool, acc_available: bool,
+                              gap_setting: int) -> CanData:
+  """Create ordinary-cruise CRZ_CTRL (0x21C) with no synthetic radar lead."""
+  gap_setting = max(0, min(7, int(gap_setting)))
+  dat = bytearray(8)
+  dat[0] = 0x02 | (int(long_active) << 3)  # MSG_1_INV, CRZ_ACTIVE
+  dat[1] = 0x01  # MSG_1_INV_COPY
+  dat[2] = 0x01 | (int(long_active or acc_available) << 1) | (gap_setting << 2)
+  if long_active:
+    dat[3] = 0x20  # ordinary cruising phase; no stop/hold phase
+    dat[6] = 0x10  # ACC_ACTIVE_2
+  return CanData(BM_CRZ_CTRL_ADDR, bytes(dat), bus)
+
+
+def create_bm_no_target_radar_frames(bus: int, counter: int) -> list[CanData]:
+  """Create the captured no-object radar keepalive set; never synthesize a lead."""
+  frames = [CanData(BM_NO_TARGET_RADAR_STATIC[0], BM_NO_TARGET_RADAR_STATIC[1], bus)]
+  ctr = counter & 0x0F
+  for addr, dat in BM_NO_TARGET_RADAR_TRACKS:
+    frames.append(CanData(addr, dat[:7] + bytes([(dat[7] & 0xF0) | ctr]), bus))
+  return frames
 
 
 def create_steering_control(packer, CP, frame, apply_torque, lkas):

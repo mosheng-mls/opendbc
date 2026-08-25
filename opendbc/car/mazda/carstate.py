@@ -1,10 +1,15 @@
 from opendbc.can import CANDefine, CANParser
-from opendbc.car import Bus, create_button_events, structs
+from opendbc.car import Bus, DT_CTRL, create_button_events, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
 from opendbc.car.mazda.values import DBC, LKAS_LIMITS
 
 ButtonType = structs.CarState.ButtonEvent.Type
+
+FSC_SETTLE_FRAMES = int(10.0 / DT_CTRL)
+STOCK_RADAR_ALIVE_FRAMES = int(0.05 / DT_CTRL)
+STOCK_RADAR_OWNERSHIP_FRAMES = STOCK_RADAR_ALIVE_FRAMES + int(1.0 / DT_CTRL)
+CANCEL_CONTEXT_FRAMES = int(0.5 / DT_CTRL)
 
 
 class CarState(CarStateBase):
@@ -22,6 +27,19 @@ class CarState(CarStateBase):
     self.accel_button = 0
     self.decel_button = 0
 
+    # These attributes always exist because CarController must fail closed
+    # before the first CAN update, including on non-longitudinal Mazda ports.
+    self.stock_radar_alive = True
+    self.bm_radar_startup_ready = False
+    self._stock_radar_silent_frames = 0
+    self._radar_was_silenced = False
+    self._cam_laneinfo_seen = False
+    self._fsc_settled_frames = 0
+    self._cruise_available = False
+    self._cruise_enabled = False
+    self._brake_pressed_prev = False
+    self._cancel_context_frames = 0
+
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
     cp_cam = can_parsers[Bus.cam]
@@ -37,6 +55,7 @@ class CarState(CarStateBase):
 
     # Match panda speed reading
     speed_kph = cp.vl["ENGINE_DATA"]["SPEED"]
+    self.engine_speed_ms = speed_kph * CV.KPH_TO_MS
     ret.standstill = speed_kph <= .1
 
     can_gear = int(cp.vl["GEAR"]["GEAR"])
@@ -77,10 +96,49 @@ class CarState(CarStateBase):
     else:
       self.lkas_allowed_speed = True
 
-    # TODO: the signal used for available seems to be the adaptive cruise signal, instead of the main on
-    #       it should be used for carState.cruiseState.nonAdaptive instead
-    ret.cruiseState.available = cp.vl["CRZ_CTRL"]["CRZ_AVAILABLE"] == 1
-    ret.cruiseState.enabled = cp.vl["CRZ_CTRL"]["CRZ_ACTIVE"] == 1
+    if self.CP.openpilotLongitudinalControl:
+      # Radar teardown removes radar-owned CRZ_CTRL. PEDALS remains body-owned
+      # and carries the wheel/PCM engagement state used by BM before and after
+      # the teardown: ACC_OFF is armed, ACC_ACTIVE is engaged.
+      acc_armed = cp.vl["PEDALS"]["ACC_OFF"] == 1
+      acc_active = cp.vl["PEDALS"]["ACC_ACTIVE"] == 1
+      brake_released_edge = not ret.brakePressed and self._brake_pressed_prev
+      if cp.vl["CRZ_BTNS"]["CAN_OFF"] == 1:
+        self._cancel_context_frames = CANCEL_CONTEXT_FRAMES
+      elif self._cancel_context_frames > 0:
+        self._cancel_context_frames -= 1
+      if acc_armed or acc_active:
+        self._cruise_available = True
+      elif brake_released_edge or self._cancel_context_frames > 0:
+        self._cruise_available = False
+      self._cruise_enabled = acc_active
+
+      ret.cruiseState.enabled = self._cruise_enabled
+
+      # Returned TX echoes use bus+128 and never enter this bus-0 parser, so
+      # CRZ_INFO arrivals here represent the physical stock source.
+      if len(cp.vl_all["CRZ_INFO"]["CTR1"]) > 0:
+        self._stock_radar_silent_frames = 0
+      else:
+        self._stock_radar_silent_frames += 1
+      self.stock_radar_alive = self._stock_radar_silent_frames < STOCK_RADAR_ALIVE_FRAMES
+      self._radar_was_silenced |= self._stock_radar_silent_frames >= STOCK_RADAR_OWNERSHIP_FRAMES
+      ret.cruiseState.available = self._cruise_available and self._radar_was_silenced and not self.stock_radar_alive
+      ret.accFaulted = self._radar_was_silenced and self.stock_radar_alive
+
+      # Wait until the FSC has completed its boot/radar-presence phase before
+      # requesting the diagnostic session. Requiring an observed frame avoids
+      # treating the parser's initial all-zero values as a stable camera.
+      self._cam_laneinfo_seen |= len(cp_cam.vl_all["CAM_LANEINFO"]["LANE_LINES"]) > 0
+      laneinfo = cp_cam.vl["CAM_LANEINFO"]
+      fsc_settled = self._cam_laneinfo_seen and not any(laneinfo[s] for s in ("NO_ERR_BIT", "BIT2", "ERR_BIT"))
+      self._fsc_settled_frames = self._fsc_settled_frames + 1 if fsc_settled else 0
+      self.bm_radar_startup_ready = self._fsc_settled_frames >= FSC_SETTLE_FRAMES
+    else:
+      # TODO: the signal used for available seems to be the adaptive cruise signal, instead of the main on
+      #       it should be used for carState.cruiseState.nonAdaptive instead
+      ret.cruiseState.available = cp.vl["CRZ_CTRL"]["CRZ_AVAILABLE"] == 1
+      ret.cruiseState.enabled = cp.vl["CRZ_CTRL"]["CRZ_ACTIVE"] == 1
     ret.cruiseState.standstill = cp.vl["PEDALS"]["STANDSTILL"] == 1
     ret.cruiseState.speed = cp.vl["CRZ_EVENTS"]["CRZ_SPEED"] * CV.KPH_TO_MS
 
@@ -101,6 +159,7 @@ class CarState(CarStateBase):
     ret.steerFaultTemporary = self.lkas_allowed_speed and lkas_blocked
 
     self.acc_active_last = ret.cruiseState.enabled
+    self._brake_pressed_prev = ret.brakePressed
 
     self.crz_btns_counter = cp.vl["CRZ_BTNS"]["CTR"]
 
@@ -127,7 +186,14 @@ class CarState(CarStateBase):
 
   @staticmethod
   def get_can_parsers(CP):
+    pt_messages = []
+    cam_messages = []
+    if CP.openpilotLongitudinalControl:
+      # CRZ_INFO is expected to disappear after takeover, so it deliberately
+      # has no liveness requirement. vl_all supplies per-cycle arrival data.
+      pt_messages.append(("CRZ_INFO", float("nan")))
+      cam_messages.append(("CAM_LANEINFO", 0))
     return {
-      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
-      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
+      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_messages, 0),
+      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_messages, 2),
     }
