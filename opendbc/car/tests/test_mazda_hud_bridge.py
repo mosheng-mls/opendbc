@@ -239,6 +239,13 @@ class TestHudBridge002Engagement(unittest.TestCase):
     self.assertTrue(out.lateral_engaged)
     self.assertEqual(out.override_lane_lines, LANE_LINES_ACTIVE)
 
+  def test4b_c4_long_with_lat_is_full_assist(self):
+    out = MazidHudBridge().update(HudInputs(
+      lat_active=True, enabled=True, long_active=True, openpilot_longitudinal_control=True))
+    self.assertEqual(out.control_mode, ControlMode.FULL_ASSIST_ACTIVE)
+    self.assertTrue(out.lateral_engaged)
+    self.assertEqual(out.override_lane_lines, LANE_LINES_ACTIVE)
+
   def test5_zero_torque_still_lateral_active(self):
     out = MazidHudBridge().update(HudInputs(lat_active=True, actuators_torque=0.0))
     self.assertEqual(out.control_mode, ControlMode.LATERAL_ACTIVE)

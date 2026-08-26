@@ -10,6 +10,10 @@ FSC_SETTLE_FRAMES = int(10.0 / DT_CTRL)
 STOCK_RADAR_ALIVE_FRAMES = int(0.05 / DT_CTRL)
 STOCK_RADAR_OWNERSHIP_FRAMES = STOCK_RADAR_ALIVE_FRAMES + int(1.0 / DT_CTRL)
 CANCEL_CONTEXT_FRAMES = int(0.5 / DT_CTRL)
+STOCK_RADAR_LIVENESS = (
+  ("CRZ_INFO", "CTR1"),
+  ("RADAR_TRACK_1", "LONG_DIST"),
+)
 
 
 class CarState(CarStateBase):
@@ -39,6 +43,18 @@ class CarState(CarStateBase):
     self._cruise_enabled = False
     self._brake_pressed_prev = False
     self._cancel_context_frames = 0
+
+  @staticmethod
+  def _stock_radar_seen(cp) -> bool:
+    # CRZ_INFO dropping is not enough: the radar can still own 0x361 after 0x21B
+    # has gone quiet. Treat either stream as the stock radar still being alive.
+    for msg, sig in STOCK_RADAR_LIVENESS:
+      try:
+        if len(cp.vl_all[msg][sig]) > 0:
+          return True
+      except (KeyError, TypeError):
+        continue
+    return False
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -116,8 +132,8 @@ class CarState(CarStateBase):
       ret.cruiseState.enabled = self._cruise_enabled
 
       # Returned TX echoes use bus+128 and never enter this bus-0 parser, so
-      # CRZ_INFO arrivals here represent the physical stock source.
-      if len(cp.vl_all["CRZ_INFO"]["CTR1"]) > 0:
+      # CRZ_INFO / RADAR_TRACK_1 arrivals here represent the physical stock source.
+      if self._stock_radar_seen(cp):
         self._stock_radar_silent_frames = 0
       else:
         self._stock_radar_silent_frames += 1
@@ -189,9 +205,11 @@ class CarState(CarStateBase):
     pt_messages = []
     cam_messages = []
     if CP.openpilotLongitudinalControl:
-      # CRZ_INFO is expected to disappear after takeover, so it deliberately
-      # has no liveness requirement. vl_all supplies per-cycle arrival data.
+      # CRZ_INFO and RADAR_TRACK_1 are expected to disappear after takeover, so
+      # they deliberately have no liveness requirement. vl_all supplies per-cycle
+      # arrival data.
       pt_messages.append(("CRZ_INFO", float("nan")))
+      pt_messages.append(("RADAR_TRACK_1", float("nan")))
       cam_messages.append(("CAM_LANEINFO", 0))
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_messages, 0),

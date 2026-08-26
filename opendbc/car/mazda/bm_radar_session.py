@@ -40,6 +40,26 @@ def create_bm_radar_tester_present_msg() -> CanData:
   return make_tester_present_msg(BM_RADAR_ADDR, BM_RADAR_BUS, suppress_response=True)
 
 
+def create_bm_radar_handback_msg() -> CanData:
+  """Ask the radar to leave the diagnostic session."""
+  return create_bm_radar_session_msg(uds.SESSION_TYPE.DEFAULT)
+
+
+def may_replace_crz(state: "BMRadarSessionState", stock_radar_alive: bool) -> bool:
+  """CRZ_INFO/CRZ_CTRL may fill the vacuum only after stock CRZ_INFO is gone."""
+  return (not stock_radar_alive and
+          state in (BMRadarSessionState.VERIFY_SILENT, BMRadarSessionState.SILENCED))
+
+
+def may_replace_radar_tracks(state: "BMRadarSessionState", stock_radar_alive: bool) -> bool:
+  """Empty 0x361 keepalive starts only after the full silent-verify window.
+
+  Sending tracks during VERIFY can collide with a radar that still owns 0x361
+  after CRZ_INFO has already dropped.
+  """
+  return (not stock_radar_alive and state == BMRadarSessionState.SILENCED)
+
+
 class BMRadarSessionState(StrEnum):
   STOCK = "stock"
   WAITING_GATE = "waiting_gate"
@@ -91,6 +111,30 @@ class BMRadarSessionManager:
 
   def _message_due(self) -> bool:
     return self._frames_in_state % BM_RADAR_UDS_STEP == 0
+
+  def needs_handback(self) -> bool:
+    return self.state not in (BMRadarSessionState.STOCK, BMRadarSessionState.WAITING_GATE)
+
+  def request_immediate_handback(self) -> BMRadarSessionOutput:
+    """Emit one DEFAULT session request. Used on card exit; does not wait for RX."""
+    if self.state in (BMRadarSessionState.STOCK, BMRadarSessionState.WAITING_GATE):
+      self._transition(BMRadarSessionState.STOCK)
+      return BMRadarSessionOutput(
+        state=self.state,
+        can_msg=None,
+        radar_silenced=False,
+        direct_longitudinal_ready=False,
+        fault_reason="",
+      )
+
+    self._transition(BMRadarSessionState.HANDBACK)
+    return BMRadarSessionOutput(
+      state=self.state,
+      can_msg=create_bm_radar_handback_msg(),
+      radar_silenced=False,
+      direct_longitudinal_ready=False,
+      fault_reason=self.fault_reason,
+    )
 
   def update(self, inp: BMRadarSessionInput) -> BMRadarSessionOutput:
     if not inp.requested:

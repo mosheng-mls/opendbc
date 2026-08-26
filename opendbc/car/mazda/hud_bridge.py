@@ -44,6 +44,8 @@ class HudInputs:
   cruise_enabled: bool = False
   v_cruise_kph: float = 0.0
   hud_set_speed_kph: float = 0.0
+  long_active: bool = False
+  openpilot_longitudinal_control: bool = False
   fsc_lane_lines: int = 1
   left_lane_visible: bool = False
   right_lane_visible: bool = False
@@ -85,6 +87,8 @@ class MazidHudBridge:
       cruise_enabled=inp.cruise_enabled,
       v_cruise_kph=inp.v_cruise_kph,
       hud_set_speed_kph=inp.hud_set_speed_kph,
+      long_active=inp.long_active,
+      openpilot_longitudinal_control=inp.openpilot_longitudinal_control,
       fsc_lane_lines=inp.fsc_lane_lines,
       left_lane_visible=inp.left_lane_visible,
       right_lane_visible=inp.right_lane_visible,

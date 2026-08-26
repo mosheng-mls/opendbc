@@ -23,8 +23,9 @@ class CarInterface(CarInterfaceBase):
       ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.BM_LOW_SPEED_STEER.value
 
     # Mazda3 BM vision-only longitudinal keeps the proven BM identity and
-    # lateral tune. The stock wheel/PCM state still owns engagement, while OP
-    # replaces only the acceleration command after the radar is silenced.
+    # lateral tune. Engagement stays with the wheel/PCM. After the radar is
+    # confirmed silent, OP replaces CRZ_INFO/CRZ_CTRL and fills empty radar
+    # keepalives; the planner itself is vision-only (radarUnavailable stays True).
     ret.alphaLongitudinalAvailable = candidate == CAR.MAZDA_3_2019
     ret.openpilotLongitudinalControl = alpha_long and ret.alphaLongitudinalAvailable
     if ret.openpilotLongitudinalControl:

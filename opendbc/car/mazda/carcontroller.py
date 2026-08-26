@@ -6,7 +6,12 @@ from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
 from opendbc.car.mazda.bm_longitudinal_guard import BMLongitudinalGuard, BMLongitudinalGuardInput
-from opendbc.car.mazda.bm_radar_session import BMRadarSessionInput, BMRadarSessionManager, BMRadarSessionState
+from opendbc.car.mazda.bm_radar_session import (
+  BMRadarSessionInput,
+  BMRadarSessionManager,
+  may_replace_crz,
+  may_replace_radar_tracks,
+)
 from opendbc.car.mazda.hud_bridge import HudInputs, MazidHudBridge
 from opendbc.car.mazda.hud_probe import MazidHudProbe, probe_enabled
 from opendbc.car.mazda.icbm import MazdaIcbmController, persistent_cruise_target_ms
@@ -183,6 +188,8 @@ class CarController(CarControllerBase):
           cruise_enabled=bool(CS.out.cruiseState.enabled),
           v_cruise_kph=float(CS.out.vCruise),
           hud_set_speed_kph=float(CC.hudControl.setSpeed),
+          long_active=bool(CC.longActive),
+          openpilot_longitudinal_control=bool(self.CP.openpilotLongitudinalControl),
           fsc_lane_lines=int(cam.get("LANE_LINES", 1) or 1),
           left_lane_visible=bool(CC.hudControl.leftLaneVisible),
           right_lane_visible=bool(CC.hudControl.rightLaneVisible),
@@ -227,28 +234,21 @@ class CarController(CarControllerBase):
       v_ego=float(CS.out.vEgo),
       long_active=planner_active,
       brake_pressed=bool(CS.out.brakePressed),
-      lead_visible=bool(CC.hudControl.leadVisible),
-      set_speed=float(CC.hudControl.setSpeed),
-      now_nanos=int(now_nanos),
     ))
     self.bm_applied_accel = guarded.accel
 
     # Preserve the active cruise mode during a gas override, but command zero.
     # Dropping the active bits mid-override caused a lurch in donor-drive data.
     gas_override = bool(CC.enabled and (CC.cruiseControl.override or CS.out.gasPressed))
-    long_engaged = bool(direct_ready and not CS.out.brakePressed and not guarded.critical_handoff and
-                        (CC.longActive or gas_override))
+    long_engaged = bool(direct_ready and not CS.out.brakePressed and (CC.longActive or gas_override))
 
-    # Once the stock stream disappears, immediately cover the FSC's expected
-    # no-target traffic while the one-second ownership verification completes.
-    radar_master = (session.state in (BMRadarSessionState.VERIFY_SILENT, BMRadarSessionState.SILENCED) and
-                    not CS.stock_radar_alive)
-    if radar_master and self.frame % 10 == 0:
+    stock_alive = bool(CS.stock_radar_alive)
+    if may_replace_radar_tracks(session.state, stock_alive) and self.frame % 10 == 0:
       for bus in BM_LONG_BUSES:
         can_sends.extend(mazdacan.create_bm_no_target_radar_frames(bus, self.bm_radar_counter))
       self.bm_radar_counter += 1
 
-    if radar_master and self.frame % 2 == 0:
+    if may_replace_crz(session.state, stock_alive) and self.frame % 2 == 0:
       acc_available = bool(CS.out.cruiseState.available)
       gap = int(CC.hudControl.leadDistanceBars) or 2
       # Verification frames are strictly inactive; active commands begin only
@@ -334,6 +334,16 @@ class CarController(CarControllerBase):
 
     if self.CP.openpilotLongitudinalControl:
       self._update_bm_longitudinal(CC, CS, now_nanos, can_sends)
+    elif self.bm_radar_session.needs_handback():
+      session = self.bm_radar_session.update(BMRadarSessionInput(
+        requested=False,
+        startup_gate_passed=bool(CS.bm_radar_startup_ready),
+        stock_radar_alive=bool(CS.stock_radar_alive),
+        vehicle_standstill=bool(CS.out.standstill),
+        stock_cruise_engaged=bool(CS.out.cruiseState.enabled),
+      ))
+      if session.can_msg is not None:
+        can_sends.append(session.can_msg)
 
     self.apply_torque_last = apply_torque
 
@@ -361,3 +371,10 @@ class CarController(CarControllerBase):
 
     self.frame += 1
     return new_actuators, can_sends
+
+  def shutdown_radar_session(self) -> list:
+    """Best-effort radar handback when card exits. Panda still requires !controls_allowed."""
+    if not self.CP.openpilotLongitudinalControl and not self.bm_radar_session.needs_handback():
+      return []
+    session = self.bm_radar_session.request_immediate_handback()
+    return [] if session.can_msg is None else [session.can_msg]

@@ -13,6 +13,8 @@ from opendbc.car.mazda.bm_radar_session import (
   BMRadarSessionState,
   create_bm_radar_session_msg,
   create_bm_radar_tester_present_msg,
+  may_replace_crz,
+  may_replace_radar_tracks,
 )
 
 
@@ -142,6 +144,26 @@ class TestBMRadarSessionManager(unittest.TestCase):
     self.assertTrue(all(msg.address == BM_RADAR_ADDR and msg.src == BM_RADAR_BUS for msg in seen))
     self.assertNotIn(0x21B, [msg.address for msg in seen])
     self.assertNotIn(0x21C, [msg.address for msg in seen])
+
+  def test_empty_radar_tracks_wait_for_silenced(self):
+    self.assertFalse(may_replace_radar_tracks(BMRadarSessionState.VERIFY_SILENT, False))
+    self.assertTrue(may_replace_radar_tracks(BMRadarSessionState.SILENCED, False))
+    self.assertFalse(may_replace_radar_tracks(BMRadarSessionState.SILENCED, True))
+    self.assertTrue(may_replace_crz(BMRadarSessionState.VERIFY_SILENT, False))
+    self.assertFalse(may_replace_crz(BMRadarSessionState.VERIFY_SILENT, True))
+
+  def test_immediate_handback_emits_default_session(self):
+    manager = BMRadarSessionManager()
+    manager.update(session_input())
+    out = manager.request_immediate_handback()
+    self.assertEqual(out.state, BMRadarSessionState.HANDBACK)
+    self.assertEqual(out.can_msg.dat, bytes.fromhex("0210010000000000"))
+    self.assertFalse(out.direct_longitudinal_ready)
+
+  def test_immediate_handback_from_stock_is_zero_tx(self):
+    out = BMRadarSessionManager().request_immediate_handback()
+    self.assertEqual(out.state, BMRadarSessionState.STOCK)
+    self.assertIsNone(out.can_msg)
 
 
 if __name__ == "__main__":

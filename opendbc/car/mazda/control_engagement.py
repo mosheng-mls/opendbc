@@ -44,6 +44,8 @@ class EngagementInputs:
   cruise_enabled: bool = False
   v_cruise_kph: float = 0.0
   hud_set_speed_kph: float = 0.0
+  long_active: bool = False
+  openpilot_longitudinal_control: bool = False
   fsc_lane_lines: int = 1
   left_lane_visible: bool = False
   right_lane_visible: bool = False
@@ -129,7 +131,7 @@ class MazidControlEngagement:
     oem_acc = bool(inp.cruise_enabled) and not lat_engaged
     # Stock enabled or MAIN available = READY, not ENGAGED.
     ready = bool(inp.enabled or inp.cruise_available or inp.lat_active) and not parked
-    c4_long = False  # no direct longitudinal on this BM
+    c4_long = bool(inp.openpilot_longitudinal_control and inp.long_active) and not parked
 
     if parked:
       mode = ControlMode.OFF
@@ -143,6 +145,9 @@ class MazidControlEngagement:
     elif lat_engaged and inp.steering_pressed:
       mode = ControlMode.DRIVER_OVERRIDE
       reason = "driver_override_while_lat_active"
+    elif lat_engaged and c4_long:
+      mode = ControlMode.FULL_ASSIST_ACTIVE
+      reason = "lat_and_c4_long_active"
     elif lat_engaged:
       mode = ControlMode.LATERAL_ACTIVE
       reason = "lat_active_control_path"
@@ -161,7 +166,8 @@ class MazidControlEngagement:
 
     return EngagementOutput(
       mode=mode,
-      lateral_engaged=lat_engaged and mode in (ControlMode.LATERAL_ACTIVE, ControlMode.DRIVER_OVERRIDE),
+      lateral_engaged=lat_engaged and mode in (ControlMode.LATERAL_ACTIVE, ControlMode.FULL_ASSIST_ACTIVE,
+                                               ControlMode.DRIVER_OVERRIDE),
       ready=ready,
       oem_acc_active=oem_acc or (inp.cruise_enabled and lat_engaged),
       c4_longitudinal_active=c4_long,
