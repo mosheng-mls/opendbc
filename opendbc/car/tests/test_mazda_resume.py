@@ -25,6 +25,8 @@ class TestMazdaResumeGate(unittest.TestCase):
       out=SimpleNamespace(
         brakePressed=False,
         steeringTorque=0.0,
+        vCruise=255.0,
+        cruiseState=SimpleNamespace(enabled=False),
       ),
       crz_btns_counter=0,
       cam_lkas={

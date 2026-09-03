@@ -204,6 +204,8 @@ struct CarState {
   lowSpeedAlert @56 :Bool;  # lost steering control due to a dynamic min steering speed
   blockPcmEnable @60 :Bool;  # whether to allow PCM to enable this frame
   carNotReady @61 :Bool;  # car is transiently refusing engagement, used to prevent a fault if engaged
+  stockRadarLead @62 :Bool;  # stock ACC radar currently reports a lead target
+  cruiseSpeedButtonPressed @63 :Bool;  # physical cruise speed/resume button is currently held
 
   # cruise state
   cruiseState @10 :CruiseState;
@@ -359,8 +361,31 @@ struct CarControl {
 
   driverMonitoringEscalation @18 :Bool; # trigger the car's stock driver monitoring escalation
 
+  # Optional request for stock-ACC SET+/SET- assistance. This is only a
+  # request; each car port must independently enforce mode and driver gates.
+  oemCruiseSetSpeedAssist @19 :OemCruiseSetSpeedAssist;
+
   cruiseControl @4 :CruiseControl;
   hudControl @5 :HUDControl;
+
+  struct OemCruiseSetSpeedAssist {
+    enabled @0 :Bool;
+    targetValid @1 :Bool;
+    targetSpeed @2 :Float32;   # m/s, never write this back into vCruise
+    sourceMonoTime @3 :UInt64; # oldest required input timestamp
+    driverSetSpeed @4 :Float32; # m/s, hard ceiling captured separately from target
+    curveWarning @5 :Bool;      # HMI only: curve requires more braking than SET can guarantee
+    curveTargetSpeed @6 :Float32; # m/s, raw preview speed before the 32 km/h SET guard
+    curveRequiredDecel @7 :Float32; # m/s^2, average decel needed by the preview
+    curveTimeToTarget @8 :Float32; # seconds until the selected preview point
+    curveSource @9 :CurveSource; # logged source of an active curve warning
+
+    enum CurveSource {
+      none @0;
+      vision @1;
+      offlineMap @2;
+    }
+  }
 
   struct Actuators {
     # lateral commands, mutually exclusive

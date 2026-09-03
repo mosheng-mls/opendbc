@@ -4,6 +4,7 @@ import unittest
 
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.mazda.icbm import (
+  ACK_TIMEOUT_FRAMES,
   MazdaIcbmController,
   MIN_PRESS_INTERVAL_FRAMES,
   V_CRUISE_UNSET_KPH,
@@ -53,6 +54,90 @@ class TestMazdaIcbm(unittest.TestCase):
     self.assertIsNone(
       icbm.update(0, enabled=True, cruise_enabled=True, cruise_speed_ms=20.0, target_speed_ms=20.3),
     )
+
+  def test_reset_requires_fresh_cooldown(self):
+    icbm = MazdaIcbmController()
+    self.assertEqual(
+      icbm.update(0, enabled=True, cruise_enabled=True, cruise_speed_ms=20.0, target_speed_ms=25.0),
+      Buttons.SET_PLUS,
+    )
+    icbm.reset(5)
+    self.assertIsNone(
+      icbm.update(5, enabled=True, cruise_enabled=True, cruise_speed_ms=20.0, target_speed_ms=25.0),
+    )
+    self.assertIsNone(
+      icbm.update(5 + MIN_PRESS_INTERVAL_FRAMES - 1, enabled=True, cruise_enabled=True,
+                  cruise_speed_ms=20.0, target_speed_ms=25.0),
+    )
+    self.assertEqual(
+      icbm.update(5 + MIN_PRESS_INTERVAL_FRAMES, enabled=True, cruise_enabled=True,
+                  cruise_speed_ms=20.0, target_speed_ms=25.0),
+      Buttons.SET_PLUS,
+    )
+
+  def test_waits_for_oem_ack_before_another_press(self):
+    icbm = MazdaIcbmController(require_ack=True)
+    self.assertEqual(
+      icbm.update(0, enabled=True, cruise_enabled=True, cruise_speed_ms=20.0, target_speed_ms=25.0),
+      Buttons.SET_PLUS,
+    )
+    self.assertIsNone(
+      icbm.update(MIN_PRESS_INTERVAL_FRAMES, enabled=True, cruise_enabled=True,
+                  cruise_speed_ms=20.0, target_speed_ms=25.0),
+    )
+    self.assertIsNone(
+      icbm.update(ACK_TIMEOUT_FRAMES, enabled=True, cruise_enabled=True,
+                  cruise_speed_ms=20.0, target_speed_ms=25.0),
+    )
+    self.assertEqual(
+      icbm.update(ACK_TIMEOUT_FRAMES + MIN_PRESS_INTERVAL_FRAMES, enabled=True, cruise_enabled=True,
+                  cruise_speed_ms=20.0, target_speed_ms=25.0),
+      Buttons.SET_PLUS,
+    )
+
+  def test_legacy_controller_keeps_original_interval_only_behavior(self):
+    icbm = MazdaIcbmController()
+    self.assertEqual(
+      icbm.update(0, enabled=True, cruise_enabled=True, cruise_speed_ms=20.0, target_speed_ms=25.0),
+      Buttons.SET_PLUS,
+    )
+    self.assertEqual(
+      icbm.update(MIN_PRESS_INTERVAL_FRAMES, enabled=True, cruise_enabled=True,
+                  cruise_speed_ms=20.0, target_speed_ms=25.0),
+      Buttons.SET_PLUS,
+    )
+
+  def test_ack_allows_next_step_after_minimum_interval(self):
+    icbm = MazdaIcbmController(require_ack=True)
+    self.assertEqual(
+      icbm.update(0, enabled=True, cruise_enabled=True, cruise_speed_ms=20.0, target_speed_ms=25.0),
+      Buttons.SET_PLUS,
+    )
+    self.assertEqual(
+      icbm.update(MIN_PRESS_INTERVAL_FRAMES, enabled=True, cruise_enabled=True,
+                  cruise_speed_ms=20.2, target_speed_ms=25.0),
+      Buttons.SET_PLUS,
+    )
+
+  def test_new_risk_reverses_pending_recovery_after_interval(self):
+    icbm = MazdaIcbmController(require_ack=True)
+    self.assertEqual(
+      icbm.update(0, enabled=True, cruise_enabled=True, cruise_speed_ms=20.0, target_speed_ms=25.0),
+      Buttons.SET_PLUS,
+    )
+    self.assertEqual(
+      icbm.update(MIN_PRESS_INTERVAL_FRAMES, enabled=True, cruise_enabled=True,
+                  cruise_speed_ms=20.0, target_speed_ms=15.0),
+      Buttons.SET_MINUS,
+    )
+
+  def test_nonfinite_speed_never_emits_button(self):
+    for cruise_speed, target_speed in ((float("nan"), 20.0), (20.0, float("nan")), (float("inf"), 20.0)):
+      with self.subTest(cruise_speed=cruise_speed, target_speed=target_speed):
+        self.assertIsNone(MazdaIcbmController().update(
+          0, enabled=True, cruise_enabled=True,
+          cruise_speed_ms=cruise_speed, target_speed_ms=target_speed,
+        ))
 
   def test_persistent_target_ignores_planner_and_hud(self):
     # TEST 1: 70 set / planner 50 → ICBM target stays 70, never 50
@@ -243,6 +328,68 @@ class TestRcTest01Replay(unittest.TestCase):
     self.assertGreater(r["BEFORE_FIX_SET_M"], 0, r)
     self.assertEqual(r["AFTER_FIX_SET_M"], 0, r)
     self.assertEqual(r["AFTER_FIX_SET_P"], 0, r)
+
+
+class TestVisionSetDoesNotAccelerate(unittest.TestCase):
+  @staticmethod
+  def run_frame(*, target_valid=False, curve_warning=False, target_speed=20.0, driver_set=25.0):
+    from types import SimpleNamespace
+
+    from opendbc.car import structs
+    from opendbc.car.mazda.carcontroller import CarController
+    from opendbc.car.mazda.interface import CarInterface
+    from opendbc.car.mazda.values import CAR, DBC
+
+    cp = CarInterface.get_non_essential_params(CAR.MAZDA_3_2019)
+    cp.openpilotLongitudinalControl = False
+    controller = CarController(DBC[CAR.MAZDA_3_2019], cp)
+    controller.frame = 10
+
+    cc = structs.CarControl()
+    cc.enabled = True
+    cc.latActive = False
+    cc.oemCruiseSetSpeedAssist.enabled = True
+    cc.oemCruiseSetSpeedAssist.targetValid = target_valid
+    cc.oemCruiseSetSpeedAssist.targetSpeed = target_speed
+    cc.oemCruiseSetSpeedAssist.driverSetSpeed = driver_set
+    cc.oemCruiseSetSpeedAssist.sourceMonoTime = 1
+    cc.oemCruiseSetSpeedAssist.curveWarning = curve_warning
+
+    cs = SimpleNamespace(
+      out=SimpleNamespace(
+        brakePressed=False,
+        gasPressed=False,
+        steeringTorque=0.0,
+        vEgo=25.0,
+        vCruise=90.0,
+        standstill=False,
+        canValid=True,
+        canTimeout=False,
+        gearShifter=structs.CarState.GearShifter.drive,
+        cruiseState=SimpleNamespace(enabled=True, available=True, speed=80.0 * KPH),
+        buttonEvents=[],
+      ),
+      cruise_buttons_pressed=False,
+      stock_radar_has_lead=False,
+      stock_radar_lead_valid=True,
+      crz_btns_counter=0,
+      cam_lkas={"BIT_1": 0, "ERR_BIT_1": 0, "ERR_BIT_2": 0},
+    )
+    _, can_sends = controller.update(cc.as_reader(), cs, 0)
+    return [msg for msg in can_sends if msg[0] == 0x09D]
+
+  def test_toggle_on_without_live_target_does_not_restore_vcruise(self):
+    self.assertEqual(self.run_frame(target_valid=False), [])
+
+  def test_curve_warning_without_live_target_does_not_restore_vcruise(self):
+    self.assertEqual(self.run_frame(curve_warning=True, target_valid=False), [])
+
+  def test_recovery_target_above_cluster_does_not_set_plus(self):
+    # Coordinator restore to 90 km/h while cluster is 80 km/h would be SET+.
+    self.assertEqual(self.run_frame(target_valid=True, target_speed=90.0 * KPH, driver_set=90.0 * KPH), [])
+
+  def test_valid_lower_target_does_not_set_minus(self):
+    self.assertEqual(self.run_frame(target_valid=True, target_speed=20.0, driver_set=25.0), [])
 
 
 if __name__ == "__main__":

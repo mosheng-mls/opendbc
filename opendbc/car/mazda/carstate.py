@@ -26,14 +26,21 @@ class CarState(CarStateBase):
     self.crz_btns_counter = 0
     self.acc_active_last = False
     self.lkas_allowed_speed = False
+    # Raw EPS authority signal. Default blocked until the first valid 0x241.
+    self.lkas_blocked = True
 
     self.distance_button = 0
     self.accel_button = 0
     self.decel_button = 0
+    self.set_plus_button = 0
+    self.cancel_button = 0
+    self.cruise_buttons_pressed = False
 
     # These attributes always exist because CarController must fail closed
     # before the first CAN update, including on non-longitudinal Mazda ports.
     self.stock_radar_alive = True
+    self.stock_radar_has_lead = False
+    self.stock_radar_lead_valid = False
     self.bm_radar_startup_ready = False
     self._stock_radar_silent_frames = 0
     self._radar_was_silenced = False
@@ -101,6 +108,7 @@ class CarState(CarStateBase):
 
     # Either due to low speed or hands off
     lkas_blocked = cp.vl["STEER_RATE"]["LKAS_BLOCK"] == 1
+    self.lkas_blocked = bool(lkas_blocked)
 
     if self.CP.minSteerSpeed > 0:
       # LKAS is enabled at 52kph going up and disabled at 45kph going down
@@ -155,6 +163,10 @@ class CarState(CarStateBase):
       #       it should be used for carState.cruiseState.nonAdaptive instead
       ret.cruiseState.available = cp.vl["CRZ_CTRL"]["CRZ_AVAILABLE"] == 1
       ret.cruiseState.enabled = cp.vl["CRZ_CTRL"]["CRZ_ACTIVE"] == 1
+      if len(cp.vl_all["CRZ_CTRL"]["RADAR_HAS_LEAD"]) > 0:
+        self.stock_radar_lead_valid = True
+        self.stock_radar_has_lead = cp.vl["CRZ_CTRL"]["RADAR_HAS_LEAD"] == 1
+      ret.stockRadarLead = bool(self.stock_radar_lead_valid and self.stock_radar_has_lead)
     ret.cruiseState.standstill = cp.vl["PEDALS"]["STANDSTILL"] == 1
     ret.cruiseState.speed = cp.vl["CRZ_EVENTS"]["CRZ_SPEED"] * CV.KPH_TO_MS
 
@@ -191,6 +203,12 @@ class CarState(CarStateBase):
     self.distance_button = cp.vl["CRZ_BTNS"]["DISTANCE_LESS"]
     self.accel_button = cp.vl["CRZ_BTNS"]["RES"]
     self.decel_button = cp.vl["CRZ_BTNS"]["SET_M"]
+    self.set_plus_button = cp.vl["CRZ_BTNS"]["SET_P"]
+    self.cancel_button = cp.vl["CRZ_BTNS"]["CAN_OFF"]
+    ret.cruiseSpeedButtonPressed = bool(self.accel_button or self.decel_button or self.set_plus_button)
+    self.cruise_buttons_pressed = any(cp.vl["CRZ_BTNS"][signal] for signal in (
+      "CAN_OFF", "RES", "SET_P", "SET_M", "DISTANCE_LESS", "DISTANCE_MORE", "MODE_X", "MODE_Y",
+    ))
 
     ret.buttonEvents = [
       *create_button_events(self.distance_button, prev_distance_button, {1: ButtonType.gapAdjustCruise}),
