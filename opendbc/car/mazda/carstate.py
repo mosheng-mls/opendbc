@@ -2,7 +2,7 @@ from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, DT_CTRL, create_button_events, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
-from opendbc.car.mazda.values import DBC, LKAS_LIMITS
+from opendbc.car.mazda.values import CAR, DBC, LKAS_LIMITS
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
@@ -194,7 +194,14 @@ class CarState(CarStateBase):
     # camera signals
     self.cam_lkas = cp_cam.vl["CAM_LKAS"]
     self.cam_laneinfo = cp_cam.vl["CAM_LANEINFO"]
-    ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1
+    # Camera-side ERR_BIT is advisory for BM: OP TX forces ERR=0 so we do not
+    # poison EPS. Do not map it to steerFaultPermanent (that hard-disables
+    # latActive until an ignition cycle). Non-BM keeps stock behavior.
+    self.cam_lkas_err_bit = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1
+    if self.CP.carFingerprint == CAR.MAZDA_3_2019:
+      ret.steerFaultPermanent = False
+    else:
+      ret.steerFaultPermanent = self.cam_lkas_err_bit
 
     # cruise control button events: distance, inc, and dec
     prev_distance_button = self.distance_button

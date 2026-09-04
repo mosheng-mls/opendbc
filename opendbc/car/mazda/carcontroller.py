@@ -1,9 +1,7 @@
 import logging
-import math
 
 from opendbc.can import CANPacker
 from opendbc.car import Bus, structs
-from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
@@ -16,17 +14,10 @@ from opendbc.car.mazda.bm_radar_session import (
 )
 from opendbc.car.mazda.hud_bridge import HudInputs, MazidHudBridge
 from opendbc.car.mazda.hud_probe import MazidHudProbe, probe_enabled
-from opendbc.car.mazda.icbm import MazdaIcbmController, persistent_cruise_target_ms
 from opendbc.car.mazda.values import CAR, CarControllerParams, Buttons
 
 LOGGER = logging.getLogger(__name__)
-GearShifter = structs.CarState.GearShifter
 BM_LONG_BUSES = (0, 2)
-SET_SPEED_REQUEST_MAX_AGE_NS = 300_000_000
-SET_SPEED_REQUEST_MAX_FUTURE_NS = 50_000_000
-OEM_MRCC_EXIT_SPEED_MPS = 30.0 * CV.KPH_TO_MS
-OEM_MRCC_TARGET_GUARD_MPS = 32.0 * CV.KPH_TO_MS
-OEM_MRCC_MAX_SET_SPEED_MPS = 145.0 * CV.KPH_TO_MS
 
 
 class CarController(CarControllerBase):
@@ -39,9 +30,6 @@ class CarController(CarControllerBase):
     self.brake_counter = 0
     self.last_cancel_frame = -self.CANCEL_RETRY_FRAMES
     self.bm_low_speed_steer = CP.carFingerprint == CAR.MAZDA_3_2019
-    self.icbm = MazdaIcbmController()
-    self.icbm_assist = MazdaIcbmController(require_ack=True)
-    self.icbm_assist_enabled = False
     self.bm_long_guard = BMLongitudinalGuard()
     self.bm_radar_session = BMRadarSessionManager()
     self.bm_long_counter = 0
@@ -291,61 +279,6 @@ class CarController(CarControllerBase):
     self.last_cancel_frame = self.frame
     return True
 
-  def _get_icbm_assist_target(self, CC, CS, now_nanos: int) -> float | None:
-    """Validate the hot OP-SET request at the final Mazda send boundary."""
-    request = CC.oemCruiseSetSpeedAssist
-    requested = bool(
-      self.bm_low_speed_steer and
-      not self.CP.openpilotLongitudinalControl and
-      request.enabled and request.targetValid
-    )
-    if not requested:
-      if self.icbm_assist_enabled:
-        self.icbm_assist.reset(self.frame)
-        self.icbm_assist_enabled = False
-      return None
-
-    source_mono_time = int(request.sourceMonoTime)
-    age_ns = int(now_nanos) - source_mono_time
-    target_speed = float(request.targetSpeed)
-    driver_set_speed = float(request.driverSetSpeed)
-    cruise_speed = float(CS.out.cruiseState.speed)
-    v_ego = float(CS.out.vEgo)
-    driver_button_pressed = (
-      bool(getattr(CS, "cruise_buttons_pressed", False)) or
-      any(bool(event.pressed) for event in CS.out.buttonEvents) or
-      any(bool(getattr(CS, name, 0)) for name in (
-        "distance_button", "accel_button", "decel_button", "set_plus_button", "cancel_button",
-      ))
-    )
-
-    enabled = bool(
-      CC.enabled and CS.out.canValid and not CS.out.canTimeout and
-      CS.out.cruiseState.available and CS.out.cruiseState.enabled and
-      not CC.cruiseControl.cancel and
-      not CS.out.brakePressed and not CS.out.gasPressed and
-      CS.out.gearShifter == GearShifter.drive and
-      not CS.out.standstill and
-      bool(getattr(CS, "stock_radar_lead_valid", False)) and
-      not bool(getattr(CS, "stock_radar_has_lead", True)) and
-      not driver_button_pressed and
-      all(math.isfinite(value) for value in (target_speed, driver_set_speed, cruise_speed, v_ego)) and
-      OEM_MRCC_TARGET_GUARD_MPS <= target_speed <= driver_set_speed <= OEM_MRCC_MAX_SET_SPEED_MPS and
-      OEM_MRCC_EXIT_SPEED_MPS <= cruise_speed <= OEM_MRCC_MAX_SET_SPEED_MPS and
-      # Assist may only lower the stock SET speed. Restoring a higher driver
-      # base is SET+ and can accelerate into a curve the coordinator just left.
-      target_speed <= cruise_speed + 0.5 and
-      v_ego >= OEM_MRCC_EXIT_SPEED_MPS and
-      source_mono_time > 0 and
-      -SET_SPEED_REQUEST_MAX_FUTURE_NS <= age_ns <= SET_SPEED_REQUEST_MAX_AGE_NS
-    )
-
-    if enabled != self.icbm_assist_enabled:
-      self.icbm_assist.reset(self.frame)
-      self.icbm_assist_enabled = enabled
-
-    return target_speed if enabled else None
-
   def update(self, CC, CS, now_nanos):
     can_sends = []
 
@@ -378,27 +311,12 @@ class CarController(CarControllerBase):
     else:
       self.brake_counter = 0
 
-    if not CC.cruiseControl.cancel:
-      if self.CP.autoResumeSng and CC.cruiseControl.resume and self.frame % 5 == 0:
-        # Mazda Stop and Go requires a RES button (or gas) press if the car stops more than 3 seconds
-        # Send Resume button when planner wants car to move
-        can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
-      elif not self.CP.openpilotLongitudinalControl:
-        # Vision SET is advisory only: it may raise a curve warning, but it must
-        # not press SET+/SET-. Persistent vCruise ICBM stays on the switch-off path.
-        assist_requested = bool(CC.oemCruiseSetSpeedAssist.enabled)
-        if not assist_requested:
-          target_speed_ms = persistent_cruise_target_ms(float(CS.out.vCruise))
-          if target_speed_ms is not None and self.frame % 10 == 0:
-            button = self.icbm.update(
-              self.frame,
-              enabled=CC.enabled,
-              cruise_enabled=CS.out.cruiseState.enabled,
-              cruise_speed_ms=float(CS.out.cruiseState.speed),
-              target_speed_ms=target_speed_ms,
-            )
-            if button is not None:
-              can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, button))
+    # RESUME only when the platform declares SnG auto-resume. BM keeps
+    # autoResumeSng=False so stock MRCC owns standstill resume.
+    # OEM-MRCC: never inject SET+/SET- (vision assist is advisory; no vCruise ICBM).
+    if (not CC.cruiseControl.cancel and self.CP.autoResumeSng and
+        CC.cruiseControl.resume and self.frame % 5 == 0):
+      can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
 
     if self.CP.openpilotLongitudinalControl:
       self._update_bm_longitudinal(CC, CS, now_nanos, can_sends)
@@ -421,7 +339,7 @@ class CarController(CarControllerBase):
                                                       self.frame, apply_torque, CS.cam_lkas))
 
     # send HUD alerts (2 Hz). Policy in HudBridge; packing in mazdacan.
-    # DISPLAY_ONLY 0x440 path. Does not change 0x243 torque or ICBM buttons.
+    # DISPLAY_ONLY 0x440 path. Does not change 0x243 torque or cruise buttons.
     if self.frame % 50 == 0:
       try:
         cam = CS.cam_laneinfo or {}

@@ -90,10 +90,12 @@ def create_steering_control(packer, CP, frame, apply_torque, lkas):
 
   # copy values from camera
   b1 = int(lkas["BIT_1"])
-  er1 = int(lkas["ERR_BIT_1"])
+  # Never forward FSC ERR bits to EPS. Echoing ERR_BIT latches OEM LKAS
+  # faults and blocks recovery; C4 digests camera errors internally.
+  er1 = 0
   lnv = 0
   ldw = 0
-  er2 = int(lkas["ERR_BIT_2"])
+  er2 = 0
 
   # Some older models do have these, newer models don't.
   # Either way, they all work just fine if set to zero.
@@ -142,15 +144,14 @@ def create_steering_control(packer, CP, frame, apply_torque, lkas):
   return packer.make_can_msg("CAM_LKAS", 0, values)
 
 
-# Copied from FSC. Do not invent TJA / ERR_BIT / LDW_WARN_* / undocumented bits.
+# Copied from FSC. Do not invent TJA / LDW_WARN_* / undocumented bits.
+# BIT2 / NO_ERR_BIT / ERR_BIT are forced clean below — same class as LKAS ERR echo.
 _CAM_LANEINFO_COPY = (
   "LINE_VISIBLE",
   "LINE_NOT_VISIBLE",
   "LANE_LINES",
   "BIT1",
-  "BIT2",
   "BIT3",
-  "NO_ERR_BIT",
   "S1",
   "S1_HBEAM",
 )
@@ -175,6 +176,10 @@ def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool,
   None-defaults keep HUD-BRIDGE-001/002 packing.
   """
   values = {s: cam_msg[s] for s in _CAM_LANEINFO_COPY}
+  # Stock healthy laneinfo keeps these at 0 (fsc_settled treats any set as unsettled).
+  values["BIT2"] = 0
+  values["NO_ERR_BIT"] = 0
+  values["ERR_BIT"] = 0
   if copy_oem:
     values["HANDS_WARN_3_BITS"] = int(cam_msg.get("HANDS_WARN_3_BITS", 0) or 0)
     values["HANDS_ON_STEER_WARN"] = bool(cam_msg.get("HANDS_ON_STEER_WARN", 0))
