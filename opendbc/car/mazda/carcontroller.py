@@ -1,220 +1,133 @@
-import logging
+from types import SimpleNamespace
 
 from opendbc.can import CANPacker
 from opendbc.car import Bus, structs
 from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
-from opendbc.car.mazda.bm_longitudinal_guard import BMLongitudinalGuard, BMLongitudinalGuardInput
-from opendbc.car.mazda.bm_radar_session import (
-  BMRadarSessionInput,
-  BMRadarSessionManager,
-  may_replace_crz,
-  may_replace_radar_tracks,
-)
-from opendbc.car.mazda.hud_bridge import HudInputs, MazidHudBridge
-from opendbc.car.mazda.hud_probe import MazidHudProbe, probe_enabled
-from opendbc.car.mazda.values import CAR, CarControllerParams, Buttons
+from opendbc.car.mazda.bm_radar_session import BMRadarSessionInput, BMRadarSessionManager, BMRadarSessionState
+from opendbc.car.mazda.values import CAR, CarControllerParams, Buttons, SteerEnvelope
 
-LOGGER = logging.getLogger(__name__)
-BM_LONG_BUSES = (0, 2)
+from opendbc.sunnypilot.car.mazda.icbm import IntelligentCruiseButtonManagementInterface
+
+VisualAlert = structs.CarControl.HUDControl.VisualAlert
+BM_VISION_LONG_BUSES = (0, 2)
+BM_DIRECT_LONG_ACCEL_MIN = -1.50
+BM_DIRECT_LONG_ACCEL_MAX = 0.60
+BM_DIRECT_LONG_ACCEL_DELTA_UP = 0.024
+BM_DIRECT_LONG_ACCEL_DELTA_DOWN = 0.030
+BM_DIRECT_LONG_ACCEL_OFFSET = 4.096
+BM_DIRECT_LONG_ACCEL_SCALE = 1000.0
 
 
-class CarController(CarControllerBase):
-  CANCEL_RETRY_FRAMES = 50
+def bm_direct_long_accel_to_milli(accel: float) -> int:
+  accel = max(BM_DIRECT_LONG_ACCEL_MIN, min(BM_DIRECT_LONG_ACCEL_MAX, float(accel)))
+  raw = int((accel + BM_DIRECT_LONG_ACCEL_OFFSET) * BM_DIRECT_LONG_ACCEL_SCALE + 0.5)
+  return raw - int(BM_DIRECT_LONG_ACCEL_OFFSET * BM_DIRECT_LONG_ACCEL_SCALE)
 
-  def __init__(self, dbc_names, CP):
-    super().__init__(dbc_names, CP)
+
+def slew_bm_direct_long_accel(target_accel: float, last_accel: float) -> float:
+  """Slew on the exact milli-m/s² grid decoded by Mazda Safety."""
+  target_milli = bm_direct_long_accel_to_milli(target_accel)
+  last_milli = bm_direct_long_accel_to_milli(last_accel)
+  up_milli = int(BM_DIRECT_LONG_ACCEL_DELTA_UP * BM_DIRECT_LONG_ACCEL_SCALE + 0.5)
+  down_milli = int(BM_DIRECT_LONG_ACCEL_DELTA_DOWN * BM_DIRECT_LONG_ACCEL_SCALE + 0.5)
+  tx_milli = max(last_milli - down_milli, min(last_milli + up_milli, target_milli))
+  return tx_milli / BM_DIRECT_LONG_ACCEL_SCALE
+
+
+def oem_hands_on_steer_warn(steer_required_alert: bool, lkas_allowed_speed: bool, standstill: bool) -> bool:
+  # BM reports LKAS_BLOCK at 0 kph. Do not light OEM "hold wheel" while stopped.
+  return bool(steer_required_alert and lkas_allowed_speed and not standstill)
+
+
+def bm_blinker_suspends_lkas(left_blinker: bool, right_blinker: bool) -> bool:
+  # Stock FSC drops LKAS_REQUEST while exactly one turn signal is on. Dual
+  # hazards keep authority. This is a send-boundary cut, not BlinkerPause.
+  return bool(left_blinker) != bool(right_blinker)
+
+
+def bleed_steer_to_zero(last_torque: int, delta_down: int) -> int:
+  down = max(1, int(delta_down))
+  if last_torque > 0:
+    return max(0, last_torque - down)
+  if last_torque < 0:
+    return min(0, last_torque + down)
+  return 0
+
+
+class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterface):
+  CANCEL_RETRY_FRAMES = 50  # 0.5 s at the 100 Hz controller rate
+
+  @staticmethod
+  def _apply_steer_limits(new_torque, apply_torque_last, driver_torque, steer_max, steer_deltas=None,
+                          steer_allowance=None):
+    limits = CarControllerParams
+    if steer_deltas is not None or steer_allowance is not None:
+      limits = SimpleNamespace(
+        STEER_DELTA_UP=steer_deltas[0] if steer_deltas is not None else CarControllerParams.STEER_DELTA_UP,
+        STEER_DELTA_DOWN=steer_deltas[1] if steer_deltas is not None else CarControllerParams.STEER_DELTA_DOWN,
+        STEER_DRIVER_ALLOWANCE=CarControllerParams.STEER_DRIVER_ALLOWANCE if steer_allowance is None else steer_allowance,
+        STEER_DRIVER_MULTIPLIER=CarControllerParams.STEER_DRIVER_MULTIPLIER,
+        STEER_DRIVER_FACTOR=CarControllerParams.STEER_DRIVER_FACTOR,
+      )
+    limited_torque = apply_driver_steer_torque_limits(new_torque, apply_torque_last,
+                                                      driver_torque, limits, steer_max)
+    return max(-steer_max, min(steer_max, limited_torque))
+
+  def __init__(self, dbc_names, CP, CP_SP):
+    CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
+    IntelligentCruiseButtonManagementInterface.__init__(self, CP, CP_SP)
     self.apply_torque_last = 0
+    self.bm_low_speed_steer = CP.carFingerprint == CAR.MAZDA_3_2019
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.brake_counter = 0
     self.last_cancel_frame = -self.CANCEL_RETRY_FRAMES
-    self.bm_low_speed_steer = CP.carFingerprint == CAR.MAZDA_3_2019
-    self.bm_long_guard = BMLongitudinalGuard()
     self.bm_radar_session = BMRadarSessionManager()
     self.bm_long_counter = 0
     self.bm_radar_counter = 0
-    self.bm_applied_accel = 0.0
-    self.hud_faults: list[str] = []
-    self.hud_last_fault = ""
-    self.hud_deployment_blocked = False
-    self.hud_probe_disabled = False
-    self.hud_enhancement_disabled = False
-    self.hud_oem_copy_fault_active = False
-    self._hud_fault_features: set[str] = set()
-
-    self.hud_bridge = None
+    self.bm_tx_accel_last = 0.0
+    self._steer_envelope = SteerEnvelope.STABLE_1300
+    self._blinker_lkas_suspend = False
+    self._params = None
     try:
-      self.hud_bridge = MazidHudBridge()
-    except Exception as exc:
-      self._disable_hud_enhancement("hud_bridge.init", exc)
-
-    self.hud_probe = None
-    try:
-      if probe_enabled():
-        self.hud_probe = MazidHudProbe()
-    except Exception as exc:
-      self._disable_hud_probe("hud_probe.init", exc)
-
-  def _record_hud_fault(self, feature: str, exc: Exception) -> None:
-    """Latch one visible deployment-blocking result for an optional HUD failure."""
-    self.hud_deployment_blocked = True
-    try:
-      detail = str(exc)
+      from openpilot.common.params import Params
+      self._params = Params()
     except Exception:
-      detail = "<unprintable>"
-    reason = f"NON_CRITICAL_FEATURE_FAILURE feature={feature} error={type(exc).__name__}:{detail} DEPLOYMENT_BLOCKED"
-    self.hud_last_fault = reason
+      self._params = None
 
-    if feature not in self._hud_fault_features:
-      self._hud_fault_features.add(feature)
-      self.hud_faults.append(reason)
-      try:
-        LOGGER.exception(reason)
-      except Exception:
-        # Failure reporting is itself non-critical and must not escape this boundary.
-        pass
+  def _should_send_cancel(self, cancel_requested, cruise_enabled, brake_pressed):
+    # Never send CANCEL after stock ACC has already disengaged. On BM, repeated
+    # CANCEL frames after the state transition can also turn cruise MAIN off.
+    if not cancel_requested or not cruise_enabled:
+      self.brake_counter = 0
+      self.last_cancel_frame = self.frame - self.CANCEL_RETRY_FRAMES
+      return False
 
-  def _disable_hud_probe(self, feature: str, exc: Exception) -> None:
-    self._record_hud_fault(feature, exc)
-    self.hud_probe_disabled = True
-    self.hud_probe = None
+    self.brake_counter += 1
+    if brake_pressed and self.brake_counter < 7:
+      return False
 
-  def _disable_hud_enhancement(self, feature: str, exc: Exception) -> None:
-    self._record_hud_fault(feature, exc)
-    self.hud_enhancement_disabled = True
+    if self.frame - self.last_cancel_frame < self.CANCEL_RETRY_FRAMES:
+      return False
 
-  @staticmethod
-  def _valid_hud_message(msg):
-    if msg[0] != 0x440:
-      raise ValueError(f"unexpected HUD address: {msg[0]!r}")
-    return msg
+    self.last_cancel_frame = self.frame
+    return True
 
-  def _send_oem_hud_copy(self, cam, can_sends) -> None:
-    """Best-effort baseline replay; retry after transient failures on later HUD ticks."""
-    try:
-      msg = self._valid_hud_message(mazdacan.create_alert_command(
-        self.packer, cam, False, False, copy_oem=True,
-      ))
-    except Exception as exc:
-      self.hud_oem_copy_fault_active = True
-      self._record_hud_fault("hud_oem_copy.pack", exc)
-      return
+  def _should_send_bm_resume(self, CC, CS) -> bool:
+    # BM declares autoResumeSng=False. Never invent RES onto stock MRCC unless
+    # that capability is explicitly enabled for the platform.
+    if self.CP.openpilotLongitudinalControl or not self.CP.autoResumeSng:
+      return False
+    if CC.cruiseControl.cancel or not CC.cruiseControl.resume or self.frame % 5 != 0:
+      return False
+    if not CS.out.cruiseState.enabled:
+      return False
+    if CS.out.brakePressed or CS.out.gasPressed:
+      return False
+    return bool(CS.out.standstill or CS.out.cruiseState.standstill)
 
-    recovered = self.hud_oem_copy_fault_active
-    self.hud_oem_copy_fault_active = False
-    can_sends.append(msg)
-    if recovered:
-      try:
-        LOGGER.warning("NON_CRITICAL_FEATURE_RECOVERY feature=hud_oem_copy.pack deployment_remains_blocked")
-      except Exception:
-        pass
-
-  def _update_optional_hud(self, CC, CS, now_nanos, cam, can_sends) -> None:
-    # Probe-only operations are isolated individually. Any failure discards the
-    # candidate and falls through to HudBridge in the same 2 Hz tick.
-    if self.hud_probe is not None and not self.hud_probe_disabled:
-      probe_tick = None
-      try:
-        probe_tick = self.hud_probe.update(
-          standstill=bool(CS.out.standstill),
-          v_ego=float(CS.out.vEgo),
-          gear=CS.out.gearShifter,
-          steer_fault_permanent=bool(CS.out.steerFaultPermanent),
-          now_ns=int(now_nanos),
-        )
-        probe_failure = getattr(self.hud_probe, "failure_reason", "")
-        if probe_failure:
-          raise RuntimeError(f"probe reported failure: {probe_failure}")
-      except Exception as exc:
-        self._disable_hud_probe("hud_probe.update", exc)
-
-      if probe_tick is not None and self.hud_probe is not None:
-        try:
-          if probe_tick.static and probe_tick.display is not None:
-            d = probe_tick.display
-            msg = self._valid_hud_message(mazdacan.create_alert_command(
-              self.packer, cam, False, False,
-              lane_lines=None if d.copy_oem else d.lane_lines,
-              line_visible=None if d.copy_oem else d.line_visible,
-              line_not_visible=None if d.copy_oem else d.line_not_visible,
-              hands_on=None if d.copy_oem else d.hands_on,
-              hands_on_2=None if d.copy_oem else d.hands_on_2,
-              hands_warn_3=None if d.copy_oem else d.hands_warn_3,
-              copy_oem=d.copy_oem,
-            ))
-          else:
-            msg = None
-        except Exception as exc:
-          self._disable_hud_probe("hud_probe.pack", exc)
-          msg = None
-
-        if msg is not None and self.hud_probe is not None:
-          try:
-            logged = self.hud_probe.log_tx(
-              gid=probe_tick.gid,
-              payload_hex=msg[1].hex(),
-              v_ego=float(CS.out.vEgo),
-              gear=CS.out.gearShifter,
-              standstill=bool(CS.out.standstill),
-              now_ns=int(now_nanos),
-            )
-            probe_failure = getattr(self.hud_probe, "failure_reason", "")
-            if logged is False or probe_failure:
-              raise RuntimeError(f"probe log failure: {probe_failure or 'unknown'}")
-          except Exception as exc:
-            self._disable_hud_probe("hud_probe.log_tx", exc)
-          else:
-            can_sends.append(msg)
-            return
-
-    # HudBridge policy and enhanced packing are also optional, but kept in
-    # separate boundaries so a healthy packer can still replay OEM 0x440.
-    if not self.hud_enhancement_disabled and self.hud_bridge is not None:
-      try:
-        hud = self.hud_bridge.update(HudInputs(
-          lat_active=bool(CC.latActive),
-          enabled=bool(CC.enabled),
-          visual_alert=CC.hudControl.visualAlert,
-          gear=CS.out.gearShifter,
-          standstill=bool(CS.out.standstill),
-          lkas_allowed_speed=bool(CS.lkas_allowed_speed),
-          steer_fault_temporary=bool(CS.out.steerFaultTemporary),
-          steer_fault_permanent=bool(CS.out.steerFaultPermanent),
-          oem_hands_on=bool(cam.get("HANDS_ON_STEER_WARN", 0)),
-          cruise_available=bool(CS.out.cruiseState.available),
-          cruise_enabled=bool(CS.out.cruiseState.enabled),
-          v_cruise_kph=float(CS.out.vCruise),
-          hud_set_speed_kph=float(CC.hudControl.setSpeed),
-          long_active=bool(CC.longActive),
-          openpilot_longitudinal_control=bool(self.CP.openpilotLongitudinalControl),
-          fsc_lane_lines=int(cam.get("LANE_LINES", 1) or 1),
-          left_lane_visible=bool(CC.hudControl.leftLaneVisible),
-          right_lane_visible=bool(CC.hudControl.rightLaneVisible),
-          actuators_torque=float(CC.actuators.torque),
-          steering_pressed=bool(CS.out.steeringPressed),
-          brake_pressed=bool(CS.out.brakePressed),
-          cancel=bool(CC.cruiseControl.cancel),
-        ))
-      except Exception as exc:
-        self._disable_hud_enhancement("hud_bridge.update", exc)
-      else:
-        try:
-          msg = self._valid_hud_message(mazdacan.create_alert_command(
-            self.packer, cam, hud.ldw, hud.steer_required,
-            lane_lines=hud.override_lane_lines,
-            line_visible=hud.line_visible,
-            line_not_visible=hud.line_not_visible,
-          ))
-        except Exception as exc:
-          self._disable_hud_enhancement("hud_bridge.pack", exc)
-        else:
-          can_sends.append(msg)
-          return
-
-    self._send_oem_hud_copy(cam, can_sends)
-
-  def _update_bm_longitudinal(self, CC, CS, now_nanos, can_sends) -> None:
+  def _update_bm_vision_longitudinal(self, CC, CS, can_sends):
     session = self.bm_radar_session.update(BMRadarSessionInput(
       requested=True,
       startup_gate_passed=bool(CS.bm_radar_startup_ready),
@@ -225,142 +138,171 @@ class CarController(CarControllerBase):
     if session.can_msg is not None:
       can_sends.append(session.can_msg)
 
+    gas_override = bool(CC.enabled and not CS.out.brakePressed and
+                        (CC.cruiseControl.override or CS.out.gasPressed))
+    direct_long_command = bool(CC.longActive) or gas_override
     direct_ready = session.direct_longitudinal_ready
-    planner_active = bool(CC.longActive and direct_ready)
-    guarded = self.bm_long_guard.update(BMLongitudinalGuardInput(
-      requested_accel=float(CC.actuators.accel),
-      v_ego=float(CS.out.vEgo),
-      long_active=planner_active,
-      brake_pressed=bool(CS.out.brakePressed),
-    ))
-    self.bm_applied_accel = guarded.accel
+    long_engaged = bool(direct_ready and direct_long_command and not CS.out.brakePressed)
+    if gas_override or not long_engaged:
+      self.bm_tx_accel_last = 0.0
 
-    # Preserve the active cruise mode during a gas override, but command zero.
-    # Dropping the active bits mid-override caused a lurch in donor-drive data.
-    gas_override = bool(CC.enabled and (CC.cruiseControl.override or CS.out.gasPressed))
-    long_engaged = bool(direct_ready and not CS.out.brakePressed and (CC.longActive or gas_override))
-
-    stock_alive = bool(CS.stock_radar_alive)
-    if may_replace_radar_tracks(session.state, stock_alive) and self.frame % 10 == 0:
-      for bus in BM_LONG_BUSES:
+    # Once the physical source disappears, cover the empty radar traffic on
+    # both separated harness sides. Verification frames stay inactive until
+    # the full one-second ownership guard has passed.
+    radar_master = (session.state in (BMRadarSessionState.VERIFY_SILENT, BMRadarSessionState.SILENCED) and
+                    not CS.stock_radar_alive)
+    if radar_master and self.frame % 10 == 0:
+      for bus in BM_VISION_LONG_BUSES:
         can_sends.extend(mazdacan.create_bm_no_target_radar_frames(bus, self.bm_radar_counter))
       self.bm_radar_counter += 1
 
-    if may_replace_crz(session.state, stock_alive) and self.frame % 2 == 0:
+    if radar_master and self.frame % 2 == 0:
       acc_available = bool(CS.out.cruiseState.available)
-      gap = int(CC.hudControl.leadDistanceBars) or 2
-      # Verification frames are strictly inactive; active commands begin only
-      # after the stock source has stayed absent for the complete guard period.
+      gap_setting = int(CC.hudControl.leadDistanceBars) or 2
       tx_engaged = long_engaged if direct_ready else False
-      tx_accel = self.bm_applied_accel if tx_engaged else 0.0
-      for bus in BM_LONG_BUSES:
+      if gas_override or not tx_engaged:
+        tx_accel = 0.0
+      else:
+        target_accel = max(BM_DIRECT_LONG_ACCEL_MIN, min(BM_DIRECT_LONG_ACCEL_MAX, float(CC.actuators.accel)))
+        tx_accel = slew_bm_direct_long_accel(target_accel, self.bm_tx_accel_last)
+        self.bm_tx_accel_last = tx_accel
+      for bus in BM_VISION_LONG_BUSES:
         can_sends.append(mazdacan.create_bm_direct_acc_command(
           bus, self.bm_long_counter, tx_accel, tx_engaged, acc_available,
         ))
         can_sends.append(mazdacan.create_bm_direct_crz_ctrl(
-          bus, tx_engaged, acc_available, gap,
+          bus, tx_engaged, acc_available, gap_setting,
         ))
       self.bm_long_counter += 1
 
-  def _should_send_bm_cancel(self, cancel_requested: bool, cruise_enabled: bool, brake_pressed: bool) -> bool:
-    # Repeated CANCEL after ACC disengages can also turn cruise MAIN off on BM,
-    # which removes the MADS lateral latch. Retry only while ACC is still active.
-    if not cancel_requested or not cruise_enabled:
-      self.brake_counter = 0
-      self.last_cancel_frame = self.frame - self.CANCEL_RETRY_FRAMES
-      return False
+  def _read_steer_envelope(self) -> int:
+    raw = None
+    if self._params is not None:
+      try:
+        raw = self._params.get("MazdaSteerEnvelope")
+      except Exception:
+        raw = None
+    if raw is None:
+      for path in ("/data/mazid/MazdaSteerEnvelope", "/data/params/d/MazdaSteerEnvelope"):
+        try:
+          with open(path, "rb") as f:
+            raw = f.read().strip()
+          break
+        except Exception:
+          continue
+      if raw is None:
+        return SteerEnvelope.STABLE_1300
+    try:
+      env = CarControllerParams.normalize_envelope(int(raw))
+    except Exception:
+      env = SteerEnvelope.STABLE_1300
+    if env != self._steer_envelope or not getattr(self, "_steer_envelope_logged", False):
+      print(f"MazdaSteerEnvelope apply {self._steer_envelope}->{env}", flush=True)
+      self._steer_envelope_logged = True
+    return env
 
-    self.brake_counter += 1
-    if brake_pressed and self.brake_counter < 7:
-      return False
-    if self.frame - self.last_cancel_frame < self.CANCEL_RETRY_FRAMES:
-      return False
-
-    self.last_cancel_frame = self.frame
-    return True
-
-  def update(self, CC, CS, now_nanos):
+  def update(self, CC, CC_SP, CS, now_nanos):
     can_sends = []
 
     apply_torque = 0
     steer_max = CarControllerParams.STEER_MAX
+    steer_deltas = None
+    steer_allowance = None
+    deadzone = CarControllerParams.STEER_DEADZONE
+    v_ego = float(getattr(CS.out, "vEgo", 0.0) or 0.0)
     if self.bm_low_speed_steer:
+      if self.frame % 10 == 0:
+        self._steer_envelope = self._read_steer_envelope()
+      env = self._steer_envelope
       engine_speed_ms = getattr(CS, "engine_speed_ms", getattr(CS.out, "vEgoRaw", 0.0))
-      steer_max = CarControllerParams.get_bm_steer_max(engine_speed_ms, CC.actuators.curvature)
+      steer_max = CarControllerParams.get_bm_steer_max(engine_speed_ms, CC.actuators.curvature, env)
+      steer_deltas = CarControllerParams.get_bm_steer_deltas(engine_speed_ms, CC.actuators.curvature, env)
+      steer_allowance = CarControllerParams.get_bm_steer_allowance(env)
+      deadzone, _ = CarControllerParams.get_bm_steer_deadzone(env)
 
-    if CC.latActive:
-      # calculate steer and also set limits due to driver torque
+    # Stop / crawl on a straight: hold still. Curvature gate keeps 90°/180 from a crawl.
+    desired_curvature = float(CC.actuators.curvature or 0.0)
+    hold_steer = bool(
+      self.bm_low_speed_steer and
+      (CS.out.standstill or v_ego < CarControllerParams.STEER_HOLD_SPEED_MS) and
+      abs(desired_curvature) < CarControllerParams.STEER_DEADZONE_CURVATURE
+    )
+    blinker_suspend = self.bm_low_speed_steer and bm_blinker_suspends_lkas(
+      bool(getattr(CS.out, "leftBlinker", False)),
+      bool(getattr(CS.out, "rightBlinker", False)),
+    )
+    if blinker_suspend != self._blinker_lkas_suspend:
+      print(f"BM blinker LKAS suspend {int(self._blinker_lkas_suspend)}->{int(blinker_suspend)}", flush=True)
+      self._blinker_lkas_suspend = blinker_suspend
+
+    if CC.latActive and not hold_steer and not blinker_suspend:
+      # Pre-GPT BM path: latActive is the send gate. LKAS_BLOCK is reported by
+      # EPS at low speed and must not zero torque on its own.
       new_torque = int(round(CC.actuators.torque * steer_max))
-      apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last,
-                                                      CS.out.steeringTorque, CarControllerParams, steer_max)
-      apply_torque = max(-steer_max, min(steer_max, apply_torque))
+      # Highway micro-wiggle: ignore tiny commands when the path is nearly straight.
+      if (self.bm_low_speed_steer and
+          abs(desired_curvature) < CarControllerParams.STEER_DEADZONE_CURVATURE and
+          abs(new_torque) < deadzone):
+        new_torque = 0
+      apply_torque = self._apply_steer_limits(new_torque, self.apply_torque_last,
+                                              CS.out.steeringTorque, steer_max, steer_deltas,
+                                              steer_allowance)
+    elif hold_steer or blinker_suspend:
+      # Softly bleed remaining command to zero instead of slamming.
+      hold_down = CarControllerParams.STEER_DELTA_DOWN
+      if steer_deltas is not None:
+        hold_down = steer_deltas[1]
+      apply_torque = bleed_steer_to_zero(self.apply_torque_last, hold_down)
 
-    if self.bm_low_speed_steer:
-      if self._should_send_bm_cancel(CC.cruiseControl.cancel, CS.out.cruiseState.enabled, CS.out.brakePressed):
+    if self.bm_low_speed_steer and not self.CP.openpilotLongitudinalControl:
+      if self._should_send_cancel(CC.cruiseControl.cancel, CS.out.cruiseState.enabled, CS.out.brakePressed):
+        # Retry conservatively while stock ACC is still active. The enabled-state
+        # gate above stops injection as soon as the vehicle reports disengagement.
         can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.CANCEL))
-    elif CC.cruiseControl.cancel:
-      # If brake is pressed, let us wait >70ms before trying to disable crz to avoid
-      # a race condition with the stock system, where the second cancel from openpilot
-      # will disable the crz 'main on'. crz ctrl msg runs at 50hz. 70ms allows us to
-      # read 3 messages and most likely sync state before we attempt cancel.
-      self.brake_counter = self.brake_counter + 1
+    elif CC.cruiseControl.cancel and not self.CP.openpilotLongitudinalControl:
+      # Preserve the upstream cancellation behavior for every non-BM Mazda.
+      self.brake_counter += 1
       if self.frame % 10 == 0 and not (CS.out.brakePressed and self.brake_counter < 7):
-        # Cancel Stock ACC if it's enabled while OP is disengaged
-        # Send at a rate of 10hz until we sync with stock ACC state
         can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.CANCEL))
     else:
       self.brake_counter = 0
 
-    # RESUME only when the platform declares SnG auto-resume. BM keeps
-    # autoResumeSng=False so stock MRCC owns standstill resume.
-    # OEM-MRCC: never inject SET+/SET- (vision assist is advisory; no vCruise ICBM).
-    if (not CC.cruiseControl.cancel and self.CP.autoResumeSng and
-        CC.cruiseControl.resume and self.frame % 5 == 0):
+    if self.bm_low_speed_steer:
+      if self._should_send_bm_resume(CC, CS):
+        can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
+    elif (not self.CP.openpilotLongitudinalControl and not CC.cruiseControl.cancel and
+          CC.cruiseControl.resume and self.frame % 5 == 0):
       can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
-
-    if self.CP.openpilotLongitudinalControl:
-      self._update_bm_longitudinal(CC, CS, now_nanos, can_sends)
-    elif self.bm_radar_session.needs_handback():
-      session = self.bm_radar_session.update(BMRadarSessionInput(
-        requested=False,
-        startup_gate_passed=bool(CS.bm_radar_startup_ready),
-        stock_radar_alive=bool(CS.stock_radar_alive),
-        vehicle_standstill=bool(CS.out.standstill),
-        stock_cruise_engaged=bool(CS.out.cruiseState.enabled),
-      ))
-      if session.can_msg is not None:
-        can_sends.append(session.can_msg)
 
     self.apply_torque_last = apply_torque
 
-    # Core 0x243 replay is deliberately outside every optional HUD boundary.
-    # Packer errors here must continue to propagate.
+    # send HUD alerts
+    if self.frame % 50 == 0:
+      ldw = CC.hudControl.visualAlert == VisualAlert.ldw
+      steer_required = oem_hands_on_steer_warn(
+        CC.hudControl.visualAlert == VisualAlert.steerRequired,
+        CS.lkas_allowed_speed,
+        CS.out.standstill,
+      )
+      can_sends.append(mazdacan.create_alert_command(self.packer, CS.cam_laneinfo, ldw, steer_required))
+
+    # send steering command
     can_sends.append(mazdacan.create_steering_control(self.packer, self.CP,
                                                       self.frame, apply_torque, CS.cam_lkas))
 
-    # send HUD alerts (2 Hz). Policy in HudBridge; packing in mazdacan.
-    # DISPLAY_ONLY 0x440 path. Does not change 0x243 torque or cruise buttons.
-    if self.frame % 50 == 0:
-      try:
-        cam = CS.cam_laneinfo or {}
-      except Exception as exc:
-        self._disable_hud_enhancement("hud.cam_laneinfo", exc)
-        self.hud_oem_copy_fault_active = True
-      else:
-        self._update_optional_hud(CC, CS, now_nanos, cam, can_sends)
+    # OEM-MRCC on BM: never inject SET+/SET- (vision assist or sunnypilot ICBM).
+    # Stock MRCC remains the only longitudinal authority.
+    if self.CP.openpilotLongitudinalControl:
+      self._update_bm_vision_longitudinal(CC, CS, can_sends)
+    elif not self.bm_low_speed_steer:
+      can_sends.extend(IntelligentCruiseButtonManagementInterface.update(
+        self, CC_SP, CS, self.packer, self.frame, self.last_button_frame))
 
     new_actuators = CC.actuators.as_builder()
     new_actuators.torque = apply_torque / steer_max
     new_actuators.torqueOutputCan = apply_torque
     if self.CP.openpilotLongitudinalControl:
-      new_actuators.accel = self.bm_applied_accel
+      new_actuators.accel = self.bm_tx_accel_last
 
     self.frame += 1
     return new_actuators, can_sends
-
-  def shutdown_radar_session(self) -> list:
-    """Best-effort radar handback when card exits. Panda still requires !controls_allowed."""
-    if not self.CP.openpilotLongitudinalControl and not self.bm_radar_session.needs_handback():
-      return []
-    session = self.bm_radar_session.request_immediate_handback()
-    return [] if session.can_msg is None else [session.can_msg]
