@@ -189,6 +189,15 @@ class CarInterfaceBase(ABC):
   def lateral_accel_from_torque(self) -> LateralAccelFromTorqueCallbackType:
     return self.lateral_accel_from_torque_linear
 
+  def get_low_demand_p_torque_cap(self) -> float | None:
+    """Optional max |P term| in normalized torque when |desired curvature| is low.
+
+    None keeps stock LatControlTorque (no recovery shaping). Platforms may
+    opt in so leftover steer angle at low speed cannot bang-bang through
+    zero; high desired curvature bypasses the cap in the controller.
+    """
+    return None
+
   # returns a set of default params to avoid repetition in car specific params
   @staticmethod
   def get_std_params(candidate: str) -> structs.CarParams:
@@ -382,7 +391,7 @@ def get_interface_attr(attr: str, combine_brands: bool = False, ignore_none: boo
   result = {}
   for car_folder in sorted([x[0] for x in os.walk(BASEDIR)]):
     try:
-      brand_name = car_folder.split('/')[-1]
+      brand_name = os.path.basename(car_folder)
       brand_values = __import__(f'opendbc.car.{brand_name}.{INTERFACE_ATTR_FILE.get(attr, "values")}', fromlist=[attr])
       if hasattr(brand_values, attr) or not ignore_none:
         attr_data = getattr(brand_values, attr, None)

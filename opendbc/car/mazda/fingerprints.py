@@ -216,6 +216,28 @@ FW_VERSIONS = {
       b'PYKE-21PS1-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
     ],
   },
+  # Authoritative live Mazda 22 F1 88 from route 00000006--2f926f3978 (2019 China BM).
+  # Do not merge these into MAZDA_3 or MAZDA_CX5_2022. Shared EPS/radar/camera only.
+  CAR.MAZDA_3_2019: {
+    (Ecu.eps, 0x730, None): [
+      b'KBST-3210X-A-00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    ],
+    (Ecu.engine, 0x7e0, None): [
+      b'PSDC-188K2-B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    ],
+    (Ecu.fwdRadar, 0x764, None): [
+      b'K131-67XK2-F\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    ],
+    (Ecu.abs, 0x760, None): [
+      b'BKD2-437AS-0-02\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    ],
+    (Ecu.fwdCamera, 0x706, None): [
+      b'GSH7-67XK2-S\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    ],
+    (Ecu.transmission, 0x7e1, None): [
+      b'PSDD-21PS1-D\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+    ],
+  },
   CAR.MAZDA_6: {
     (Ecu.eps, 0x730, None): [
       b'GBEF-3210X-B-00\x00\x00\x00\x00\x00\x00\x00\x00\x00',

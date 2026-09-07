@@ -2,14 +2,17 @@
 from opendbc.car import get_safety_config, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarInterfaceBase
+from opendbc.car.mazda.bm_longitudinal_guard import BM_ACCEL_MAX, BM_ACCEL_MIN
 from opendbc.car.mazda.carcontroller import CarController
 from opendbc.car.mazda.carstate import CarState
-from opendbc.car.mazda.values import CAR, LKAS_LIMITS
+from opendbc.car.mazda.radar_interface import RadarInterface
+from opendbc.car.mazda.values import CAR, LKAS_LIMITS, LOW_DEMAND_P_TORQUE_CAP, MazdaSafetyFlags
 
 
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
+  RadarInterface = RadarInterface
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
@@ -17,16 +20,54 @@ class CarInterface(CarInterfaceBase):
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.mazda)]
     ret.radarUnavailable = True
 
-    ret.dashcamOnly = candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_CX9_2021)
+    if candidate == CAR.MAZDA_3_2019:
+      ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.BM_LOW_SPEED_STEER.value
+
+    # Mazda3 BM vision-only longitudinal keeps the proven BM identity and
+    # lateral tune. Engagement stays with the wheel/PCM. After the radar is
+    # confirmed silent, OP replaces CRZ_INFO/CRZ_CTRL and fills empty radar
+    # keepalives; the planner itself is vision-only (radarUnavailable stays True).
+    ret.alphaLongitudinalAvailable = candidate == CAR.MAZDA_3_2019
+    ret.openpilotLongitudinalControl = alpha_long and ret.alphaLongitudinalAvailable
+    if ret.openpilotLongitudinalControl:
+      ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.VISION_ONLY_RADAR.value
+      ret.pcmCruise = True
+      ret.longitudinalActuatorDelay = 0.30
+      ret.stopAccel = BM_ACCEL_MIN
+
+    # LONG-007: this Mazda3's OEM ACC exits near 30 km/h and has no verified
+    # stop-and-go state to resume. Keep generic Mazda auto-resume available for
+    # platforms that support it, but fail closed on the 2019 Mazda3 BM.
+    if candidate == CAR.MAZDA_3_2019:
+      ret.autoResumeSng = False
+
+    # Driving MVP (DRIVE-MVP-001): MAZDA_3_2019 is a first-class drivable platform.
+    # Do not reuse CX5_2022 as a live identity substitute — only share capability flags here.
+    ret.dashcamOnly = candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_CX9_2021, CAR.MAZDA_3_2019)
 
     ret.steerActuatorDelay = 0.1
     ret.steerLimitTimer = 0.8
 
     CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
 
-    if candidate not in (CAR.MAZDA_CX5_2022,):
+    # Product requirement: minSteerSpeed = 0 (not a Safety disable).
+    if candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_3_2019):
       ret.minSteerSpeed = LKAS_LIMITS.DISABLE_SPEED * CV.KPH_TO_MS
 
     ret.centerToFront = ret.wheelbase * 0.41
 
     return ret
+
+  @staticmethod
+  def get_pid_accel_limits(CP, current_speed, cruise_speed):
+    if CP.carFingerprint == CAR.MAZDA_3_2019 and CP.openpilotLongitudinalControl:
+      return BM_ACCEL_MIN, BM_ACCEL_MAX
+    return CarInterfaceBase.get_pid_accel_limits(CP, current_speed, cruise_speed)
+
+  def get_low_demand_p_torque_cap(self) -> float | None:
+    # MAZDA_3_2019 reuses GEN1 MAZDA_3 body specs and CX9 torque substitute.
+    # Protocol reuse is not a free pass on lateral gains: low-speed KP * leftover
+    # steer angle pegs reverse torque through zero (RC_TEST_01 RC1-LAT-001).
+    if self.CP.carFingerprint in (CAR.MAZDA_3, CAR.MAZDA_3_2019):
+      return LOW_DEMAND_P_TORQUE_CAP
+    return None
