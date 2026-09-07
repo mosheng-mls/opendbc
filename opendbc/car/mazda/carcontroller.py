@@ -7,9 +7,8 @@ from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
 from opendbc.car.mazda.bm_longitudinal_guard import BM_ACCEL_MIN as BM_DIRECT_LONG_ACCEL_MIN, BM_ACCEL_MAX as BM_DIRECT_LONG_ACCEL_MAX
 from opendbc.car.mazda.bm_radar_session import BMRadarSessionInput, BMRadarSessionManager, may_replace_crz, may_replace_radar_tracks
+from opendbc.car.mazda.icbm import MazdaIcbmController, persistent_cruise_target_ms
 from opendbc.car.mazda.values import CAR, CarControllerParams, Buttons, SteerEnvelope
-
-from opendbc.sunnypilot.car.mazda.icbm import IntelligentCruiseButtonManagementInterface
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 BM_VISION_LONG_BUSES = (0, 2)
@@ -61,7 +60,7 @@ def bleed_steer_to_zero(last_torque: int, delta_down: int) -> int:
   return 0
 
 
-class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterface):
+class CarController(CarControllerBase):
   CANCEL_RETRY_FRAMES = 50  # 0.5 s at the 100 Hz controller rate
 
   @staticmethod
@@ -87,9 +86,9 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       limited_torque = min(-steer_max, int(apply_torque_last) + down)
     return int(limited_torque)
 
-  def __init__(self, dbc_names, CP, CP_SP):
-    CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
-    IntelligentCruiseButtonManagementInterface.__init__(self, CP, CP_SP)
+  def __init__(self, dbc_names, CP):
+    super().__init__(dbc_names, CP)
+    self.icbm = MazdaIcbmController()
     self.apply_torque_last = 0
     self.bm_low_speed_steer = CP.carFingerprint == CAR.MAZDA_3_2019
     self.packer = CANPacker(dbc_names[Bus.pt])
@@ -222,7 +221,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       self._steer_envelope_logged = True
     return env
 
-  def update(self, CC, CC_SP, CS, now_nanos):
+  def update(self, CC, CS, now_nanos):
     can_sends = []
 
     apply_torque = 0
@@ -328,9 +327,19 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     # Stock MRCC remains the only longitudinal authority.
     if self.CP.openpilotLongitudinalControl:
       self._update_bm_vision_longitudinal(CC, CS, can_sends)
-    elif not self.bm_low_speed_steer:
-      can_sends.extend(IntelligentCruiseButtonManagementInterface.update(
-        self, CC_SP, CS, self.packer, self.frame, self.last_button_frame))
+    elif (not self.bm_low_speed_steer and not CC.cruiseControl.cancel and
+          not CC.cruiseControl.resume and not CC.oemCruiseSetSpeedAssist.enabled and self.frame % 10 == 0):
+      # The local ICBM port follows the driver's persistent set speed only.
+      # Planner/HUD and advisory targets must never become SET button requests.
+      button = self.icbm.update(
+        self.frame,
+        enabled=CC.enabled,
+        cruise_enabled=CS.out.cruiseState.enabled,
+        cruise_speed_ms=float(CS.out.cruiseState.speed),
+        target_speed_ms=persistent_cruise_target_ms(float(CS.out.vCruise)),
+      )
+      if button is not None:
+        can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, button))
 
     new_actuators = CC.actuators.as_builder()
     new_actuators.torque = apply_torque / steer_max

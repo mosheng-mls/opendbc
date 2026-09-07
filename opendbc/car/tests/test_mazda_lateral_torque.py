@@ -12,10 +12,7 @@ from opendbc.car.mazda.values import CAR, DBC
 class TestMazdaLateralTorque(unittest.TestCase):
   def test_lat_active_applies_torque_when_lkas_blocked(self):
     cp = CarInterface.get_non_essential_params(CAR.MAZDA_3_2019)
-    try:
-      controller = CarController(DBC[CAR.MAZDA_3_2019], cp, None)
-    except TypeError:
-      controller = CarController(DBC[CAR.MAZDA_3_2019], cp)
+    controller = CarController(DBC[CAR.MAZDA_3_2019], cp)
     controller.frame = 5
 
     cc = structs.CarControl()
@@ -51,10 +48,7 @@ class TestMazdaLateralTorque(unittest.TestCase):
       },
     )
 
-    try:
-      actuators, _ = controller.update(cc.as_reader(), None, cs, 0)
-    except TypeError:
-      actuators, _ = controller.update(cc.as_reader(), cs, 0)
+    actuators, _ = controller.update(cc.as_reader(), cs, 0)
     self.assertNotEqual(actuators.torqueOutputCan, 0)
     self.assertNotEqual(actuators.torque, 0.0)
 

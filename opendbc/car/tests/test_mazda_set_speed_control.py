@@ -109,8 +109,9 @@ class TestMazdaSetSpeedControl(unittest.TestCase):
     cs = MazdaCarState(cp)
     parsers = cs.get_can_parsers(cp)
     initial = cs.update(parsers)  # register lazily parsed DBC messages
-    self.assertTrue(initial.stockRadarLead)
-    self.assertTrue(cs.stock_radar_has_lead)
+    self.assertFalse(initial.stockRadarLead)
+    self.assertFalse(cs.stock_radar_has_lead)
+    self.assertFalse(cs.stock_radar_lead_valid)
     packer = CANPacker(DBC[CAR.MAZDA_3_2019][Bus.pt])
 
     for raw, expected in ((1, True), (0, False)):

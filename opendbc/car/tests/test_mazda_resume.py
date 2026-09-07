@@ -24,6 +24,7 @@ class TestMazdaResumeGate(unittest.TestCase):
     cs = SimpleNamespace(
       out=SimpleNamespace(
         brakePressed=False,
+        standstill=True,
         steeringTorque=0.0,
         vCruise=255.0,
         cruiseState=SimpleNamespace(enabled=False),

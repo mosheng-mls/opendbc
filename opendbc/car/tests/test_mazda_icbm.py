@@ -330,6 +330,73 @@ class TestRcTest01Replay(unittest.TestCase):
     self.assertEqual(r["AFTER_FIX_SET_P"], 0, r)
 
 
+class TestMazdaIcbmCarController(unittest.TestCase):
+  def setUp(self):
+    from types import SimpleNamespace
+
+    from opendbc.car import structs
+    from opendbc.car.mazda.carcontroller import CarController
+    from opendbc.car.mazda.interface import CarInterface
+    from opendbc.car.mazda.values import CAR, DBC
+
+    self.cp = CarInterface.get_non_essential_params(CAR.MAZDA_CX5_2022)
+    self.controller = CarController(DBC[CAR.MAZDA_CX5_2022], self.cp)
+    self.controller.frame = 10  # exercise SET cadence without unrelated HUD work
+    self.cc = structs.CarControl()
+    self.cc.enabled = True
+    self.cc.hudControl.setSpeed = 40.0 * KPH
+    self.cs = SimpleNamespace(
+      out=SimpleNamespace(
+        brakePressed=False, vCruise=70.0,
+        cruiseState=SimpleNamespace(enabled=True, speed=70.0 * KPH),
+      ),
+      crz_btns_counter=0,
+      cam_lkas={"BIT_1": 0, "ERR_BIT_1": 0, "ERR_BIT_2": 0},
+    )
+
+  def button_messages(self):
+    _, messages = self.controller.update(self.cc.as_reader(), self.cs, 0)
+    return [msg for msg in messages if msg[0] == 0x09D]
+
+  def expected_button(self, button):
+    from opendbc.car.mazda import mazdacan
+    return mazdacan.create_button_cmd(self.controller.packer, self.cp, self.cs.crz_btns_counter, button)
+
+  def test_persistent_set_matches_oem_despite_lower_hud(self):
+    self.assertEqual(self.button_messages(), [])
+
+  def test_persistent_set_drives_real_buttons_with_existing_cooldown(self):
+    self.cs.out.vCruise = 75.0
+    self.assertEqual(self.button_messages(), [self.expected_button(Buttons.SET_PLUS)])
+    self.controller.frame = 20
+    self.assertEqual(self.button_messages(), [])
+    self.controller.frame = 30
+    self.cs.out.vCruise = 65.0
+    self.assertEqual(self.button_messages(), [self.expected_button(Buttons.SET_MINUS)])
+
+  def test_advisory_and_invalid_persistent_set_do_not_inject_buttons(self):
+    self.cs.out.vCruise = 75.0
+    self.cc.oemCruiseSetSpeedAssist.enabled = True
+    self.cc.oemCruiseSetSpeedAssist.targetValid = True
+    self.cc.oemCruiseSetSpeedAssist.targetSpeed = 60.0 * KPH
+    self.assertEqual(self.button_messages(), [])
+    self.cc.oemCruiseSetSpeedAssist.enabled = False
+    for invalid in (255.0, 0.0, float("nan")):
+      with self.subTest(invalid=invalid):
+        self.controller.frame = 10
+        self.cs.out.vCruise = invalid
+        self.assertEqual(self.button_messages(), [])
+
+  def test_cancel_and_resume_never_add_set_button(self):
+    self.cs.out.vCruise = 75.0
+    self.cc.cruiseControl.cancel = True
+    self.assertEqual(self.button_messages(), [self.expected_button(Buttons.CANCEL)])
+    self.controller.frame = 30
+    self.cc.cruiseControl.cancel = False
+    self.cc.cruiseControl.resume = True
+    self.assertEqual(self.button_messages(), [self.expected_button(Buttons.RESUME)])
+
+
 class TestVisionSetDoesNotAccelerate(unittest.TestCase):
   @staticmethod
   def run_frame(*, target_valid=False, curve_warning=False, target_speed=20.0, driver_set=25.0):

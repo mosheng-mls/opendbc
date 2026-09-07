@@ -214,7 +214,7 @@ class TestBMRadarControllerSession(unittest.TestCase):
     self.long_addresses = self.radar_addresses | {0x21B, 0x21C, BM_RADAR_ADDR}
 
   def step(self):
-    return [CanData(*msg) for msg in self.controller.update(self.cc, None, self.cs, 0)[1]]
+    return [CanData(*msg) for msg in self.controller.update(self.cc, self.cs, 0)[1]]
 
   def settle_silent(self):
     self.step()

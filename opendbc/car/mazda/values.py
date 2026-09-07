@@ -236,6 +236,11 @@ class LKAS_LIMITS:
   ENABLE_SPEED = 52     # kph
 
 
+# Cap normalized lateral P only at low desired curvature; the torque controller
+# bypasses this cap for high-curvature demand. Preserve the existing local tune.
+LOW_DEMAND_P_TORQUE_CAP = 0.45
+
+
 class Buttons:
   NONE = 0
   SET_PLUS = 1
@@ -245,6 +250,7 @@ class Buttons:
 
 
 FW_QUERY_CONFIG = FwQueryConfig(
+  fw_version_regex=br"[A-Z0-9-]{11,16}\x00{8,13}",
   requests=[
     # TODO: check data to ensure ABS does not skip ISO-TP frames on bus 0
     Request(
