@@ -73,7 +73,14 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       )
     limited_torque = apply_driver_steer_torque_limits(new_torque, apply_torque_last,
                                                       driver_torque, limits, steer_max)
-    return max(-steer_max, min(steer_max, limited_torque))
+    # Hard-clipping to a newly lower cap (1500→800) can exceed panda rate and
+    # the frame is rejected, not clamped. Slew the rail the same as torque.
+    down = int(getattr(limits, "STEER_DELTA_DOWN", CarControllerParams.STEER_DELTA_DOWN))
+    if limited_torque > steer_max:
+      limited_torque = max(steer_max, int(apply_torque_last) - down)
+    elif limited_torque < -steer_max:
+      limited_torque = min(-steer_max, int(apply_torque_last) + down)
+    return int(limited_torque)
 
   def __init__(self, dbc_names, CP, CP_SP):
     CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
@@ -247,8 +254,13 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       apply_torque = self._apply_steer_limits(new_torque, self.apply_torque_last,
                                               CS.out.steeringTorque, steer_max, steer_deltas,
                                               steer_allowance)
-    elif hold_steer or blinker_suspend:
-      # Softly bleed remaining command to zero instead of slamming.
+    elif blinker_suspend:
+      # Stock FSC drops LKAS_REQUEST with the turn signal. Bleeding at the
+      # straight 6/8 rate left 1500 on the bus for ~2 s and tripped OEM DTC.
+      # 25 counts / 10 ms is panda BM max_rate_down — fastest legal drop.
+      apply_torque = bleed_steer_to_zero(
+        self.apply_torque_last, CarControllerParams.STEER_BLINKER_DELTA_DOWN)
+    elif hold_steer:
       hold_down = CarControllerParams.STEER_DELTA_DOWN
       if steer_deltas is not None:
         hold_down = steer_deltas[1]

@@ -12,7 +12,10 @@ from opendbc.car.mazda.values import CAR, DBC
 class TestMazdaLateralTorque(unittest.TestCase):
   def test_lat_active_applies_torque_when_lkas_blocked(self):
     cp = CarInterface.get_non_essential_params(CAR.MAZDA_3_2019)
-    controller = CarController(DBC[CAR.MAZDA_3_2019], cp)
+    try:
+      controller = CarController(DBC[CAR.MAZDA_3_2019], cp, None)
+    except TypeError:
+      controller = CarController(DBC[CAR.MAZDA_3_2019], cp)
     controller.frame = 5
 
     cc = structs.CarControl()
@@ -48,7 +51,10 @@ class TestMazdaLateralTorque(unittest.TestCase):
       },
     )
 
-    actuators, _ = controller.update(cc.as_reader(), cs, 0)
+    try:
+      actuators, _ = controller.update(cc.as_reader(), None, cs, 0)
+    except TypeError:
+      actuators, _ = controller.update(cc.as_reader(), cs, 0)
     self.assertNotEqual(actuators.torqueOutputCan, 0)
     self.assertNotEqual(actuators.torque, 0.0)
 
@@ -74,51 +80,43 @@ class TestMazdaSteerSmoothness(unittest.TestCase):
     deadzone, curv = P.get_bm_steer_deadzone(SteerEnvelope.TEST)
     self.assertGreaterEqual(deadzone, 30)
     self.assertGreaterEqual(curv, 0.002)
-    self.assertEqual(P.get_bm_steer_deadzone(SteerEnvelope.STABLE_1300)[0], 0)
+    self.assertEqual(P.get_bm_steer_deadzone(SteerEnvelope.STABLE_1300)[0], P.STEER_DEADZONE)
 
   def test_stable_1300_envelope(self):
     from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope
     kph = lambda v: v / 3.6
     env = SteerEnvelope.STABLE_1300
-    self.assertEqual(P.get_bm_steer_max(kph(8), 0.0, env), 800)
-    self.assertEqual(P.get_bm_steer_max(kph(50), 0.0, env), 800)
+    self.assertEqual(P.get_bm_steer_max(kph(8), 0.0, env), 1300)
+    self.assertEqual(P.get_bm_steer_max(kph(50), 0.0, env), 1300)
     self.assertEqual(P.get_bm_steer_max(kph(8), 0.05, env), 1300)
-    self.assertEqual(P.get_bm_steer_max(kph(50), 0.025, env), 800)
-    self.assertEqual(P.get_bm_steer_max(kph(50), 0.0078, env), 800)
+    self.assertEqual(P.get_bm_steer_max(kph(80), 0.0, env), 1300)
 
-  def test_test_envelope_ramps(self):
+  def test_test_envelope_is_reserved_1500_pack(self):
     from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope
     kph = lambda v: v / 3.6
     env = SteerEnvelope.TEST
     self.assertEqual(P.get_bm_steer_max(kph(8), 0.0, env), 800)
-    self.assertEqual(P.get_bm_steer_max(kph(50), 0.0, env), 800)
-    self.assertEqual(P.get_bm_steer_max(kph(8), 0.05, env), 1500)
-    self.assertEqual(P.get_bm_steer_max(kph(50), 0.025, env), 1500)
-    self.assertEqual(P.get_bm_steer_max(kph(70), 0.05, env), 800)
+    self.assertEqual(P.get_bm_steer_max(kph(50), 0.05, env), 1500)
+    self.assertEqual(P.get_bm_steer_max(kph(80), 0.0, env), 800)
     self.assertEqual(P.get_bm_steer_max(kph(80), 0.05, env), 800)
-    mid = P.get_bm_steer_max(kph(50), 0.0078, env)
-    self.assertGreater(mid, 1000)
-    self.assertLessEqual(mid, 1500)
+    self.assertEqual(P.get_bm_steer_max(kph(50), 0.0, env), 800)
 
-  def test_ramp_speed_split(self):
+  def test_a_gate_opens_on_highway_accel(self):
     from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope
     kph = lambda v: v / 3.6
-    env = SteerEnvelope.TEST
-    self.assertEqual(P.get_bm_steer_max(kph(8), 0.0, env), 800)
-    self.assertEqual(P.get_bm_steer_max(kph(50), 0.0, env), 800)
-    self.assertEqual(P.get_bm_steer_max(kph(60), 0.0, env), 800)
-    self.assertEqual(P.get_bm_steer_max(kph(8), 0.05, env), 1500)
-    self.assertEqual(P.get_bm_steer_max(kph(50), 0.025, env), 1500)
-    self.assertEqual(P.get_bm_steer_max(kph(70), 0.05, env), 800)
-    self.assertEqual(P.get_bm_steer_max(kph(80), 0.05, env), 800)
-    mid = P.get_bm_steer_max(kph(50), 0.012, env)
-    self.assertEqual(mid, 1500)
+    env = SteerEnvelope.A_GATE
+    self.assertEqual(P.get_bm_steer_max(kph(50), 0.05, env), 1500)
+    self.assertEqual(P.get_bm_steer_max(kph(100), 0.0005, env), 800)
+    self.assertEqual(P.get_bm_steer_max(kph(100), 0.002, env), 1320)
+    self.assertEqual(P.get_bm_steer_max(kph(100), 0.003888, env), 1500)
+    self.assertEqual(P.get_bm_steer_max(kph(80), 0.004, env), 1500)
 
   def test_default_envelope_is_stable_1300(self):
     from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope
     kph = lambda v: v / 3.6
     self.assertEqual(P.normalize_envelope(None), SteerEnvelope.STABLE_1300)
     self.assertEqual(P.normalize_envelope(99), SteerEnvelope.STABLE_1300)
+    self.assertEqual(P.normalize_envelope(2), SteerEnvelope.A_GATE)
     self.assertEqual(P.get_bm_steer_max(kph(8), 0.05), 1300)
     self.assertEqual(P.get_bm_steer_max(kph(8), 0.05, None), 1300)
 
@@ -137,6 +135,26 @@ class TestMazdaBlinkerLkasSuspend(unittest.TestCase):
     self.assertEqual(bleed_steer_to_zero(-40, 16), -24)
     self.assertEqual(bleed_steer_to_zero(10, 16), 0)
     self.assertEqual(bleed_steer_to_zero(0, 16), 0)
+
+  def test_blinker_bleed_from_1500_is_panda_legal(self):
+    from opendbc.car.mazda.carcontroller import bleed_steer_to_zero
+    from opendbc.car.mazda.values import CarControllerParams as P
+    down = P.STEER_BLINKER_DELTA_DOWN
+    self.assertEqual(down, 25)
+    t = 1500
+    steps = 0
+    while t != 0 and steps < 80:
+      nxt = bleed_steer_to_zero(t, down)
+      self.assertLessEqual(abs(t) - abs(nxt), down)
+      t = nxt
+      steps += 1
+    self.assertEqual(t, 0)
+    self.assertLessEqual(steps, 60)
+
+  def test_cap_drop_does_not_hard_clip(self):
+    clipped = CarController._apply_steer_limits(0, 1400, 0.0, 800)
+    self.assertGreater(clipped, 800)
+    self.assertLessEqual(1400 - clipped, 8)
 
 
 if __name__ == "__main__":

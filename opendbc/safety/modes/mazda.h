@@ -44,17 +44,13 @@ static const TorqueSteeringLimits MAZDA_STEERING_LIMITS = {
 };
 
 static const TorqueSteeringLimits MAZDA_BM_STEERING_LIMITS = {
-  .max_torque = 1100,
-  .dynamic_max_torque = true,
-  .max_torque_lookup = {
-    {0.0, (20.0 * KPH_TO_MS) - 1.0, (35.0 * KPH_TO_MS) - 1.0},
-    {1100, 1100, 799},
-  },
-  .max_rate_up = 10,
+  .max_torque = 1500,
+  .dynamic_max_torque = false,
+  .max_rate_up = 16,
   .max_rate_down = 25,
-  .max_rt_delta = 300,
+  .max_rt_delta = 700,
   .driver_torque_multiplier = 1,
-  .driver_torque_allowance = 15,
+  .driver_torque_allowance = 22,
   .type = TorqueDriverLimited,
 };
 
