@@ -80,16 +80,26 @@ class TestMazdaSteerSmoothness(unittest.TestCase):
     deadzone, curv = P.get_bm_steer_deadzone(SteerEnvelope.TEST)
     self.assertGreaterEqual(deadzone, 30)
     self.assertGreaterEqual(curv, 0.002)
-    self.assertEqual(P.get_bm_steer_deadzone(SteerEnvelope.STABLE_1300)[0], P.STEER_DEADZONE)
+    self.assertEqual(P.get_bm_steer_deadzone(SteerEnvelope.STABLE_1300)[0], 0)
 
   def test_stable_1300_envelope(self):
     from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope
     kph = lambda v: v / 3.6
     env = SteerEnvelope.STABLE_1300
-    self.assertEqual(P.get_bm_steer_max(kph(8), 0.0, env), 1300)
-    self.assertEqual(P.get_bm_steer_max(kph(50), 0.0, env), 1300)
-    self.assertEqual(P.get_bm_steer_max(kph(8), 0.05, env), 1300)
-    self.assertEqual(P.get_bm_steer_max(kph(80), 0.0, env), 1300)
+    cases = (
+      (8, 0.0, 800), (50, 0.0, 800), (80, 0.0, 800),
+      (8, 0.05, 1300), (20, 0.025, 800), (20, 0.0375, 1050), (20, 0.05, 1300),
+      (27.5, 0.0375, 925), (27.5, 0.05, 1050), (35, 0.05, 800), (100, 0.05, 800),
+      (-5, 0.05, 1300),
+    )
+    for speed, curvature, expected in cases:
+      for sign in (-1, 1):
+        with self.subTest(speed=speed, curvature=sign * curvature):
+          self.assertEqual(P.get_bm_steer_max(kph(speed), sign * curvature, env), expected)
+    for invalid in (float("nan"), float("inf"), float("-inf")):
+      with self.subTest(invalid=invalid):
+        self.assertEqual(P.get_bm_steer_max(invalid, 0.05, env), 800)
+        self.assertEqual(P.get_bm_steer_max(kph(8), invalid, env), 800)
 
   def test_test_envelope_is_reserved_1500_pack(self):
     from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope
@@ -100,6 +110,39 @@ class TestMazdaSteerSmoothness(unittest.TestCase):
     self.assertEqual(P.get_bm_steer_max(kph(80), 0.0, env), 800)
     self.assertEqual(P.get_bm_steer_max(kph(80), 0.05, env), 800)
     self.assertEqual(P.get_bm_steer_max(kph(50), 0.0, env), 800)
+
+  def test_stable_1300_keeps_weekend_rates(self):
+    from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope
+    for curvature in (0.0, 0.001, -0.05):
+      self.assertEqual(P.get_bm_steer_deltas(10.0, curvature, SteerEnvelope.STABLE_1300), (10, 25))
+      self.assertEqual(P.get_bm_steer_deltas(15 / 3.6, curvature, SteerEnvelope.STABLE_1300), (16, 15))
+    self.assertEqual(P.get_bm_steer_deltas(float("nan"), 0.0, SteerEnvelope.STABLE_1300), (10, 25))
+
+  def test_optimized_1300_is_separate_and_demand_based(self):
+    from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope
+    env = SteerEnvelope.OPTIMIZED_1300
+    self.assertEqual(env, 3)
+    self.assertEqual(P.normalize_envelope("3"), env)
+    for sign in (-1, 1):
+      for curvature, cap in ((0.0, 800), (0.008, 800), (0.013, 1050), (0.018, 1300)):
+        with self.subTest(curvature=sign * curvature):
+          self.assertEqual(P.get_bm_steer_max(10.0, sign * curvature, env), cap)
+          self.assertEqual(P.get_bm_steer_max(10.0, sign * curvature, SteerEnvelope.STABLE_1300), 800)
+    self.assertEqual(P.get_bm_steer_max(8 / 3.6, 0.05, env), 1300)
+    self.assertEqual(P.get_bm_steer_max(100 / 3.6, 0.0, env), 800)
+    for invalid in (float("nan"), float("inf"), float("-inf")):
+      self.assertEqual(P.get_bm_steer_max(invalid, 0.05, env), 800)
+      self.assertEqual(P.get_bm_steer_max(10.0, invalid, env), 800)
+
+  def test_optimized_1300_straight_and_turn_response(self):
+    from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope
+    env = SteerEnvelope.OPTIMIZED_1300
+    self.assertEqual(P.get_bm_steer_deltas(10.0, 0.0, env), (6, 8))
+    self.assertEqual(P.get_bm_steer_deltas(10.0, 0.018, env), (10, 25))
+    self.assertEqual(P.get_bm_steer_deltas(8 / 3.6, 0.05, env), (16, 15))
+    self.assertEqual(P.get_bm_steer_deadzone(env, 10.0, 0.0)[0], 36)
+    self.assertEqual(P.get_bm_steer_deadzone(env, 10.0, 0.013)[0], 18)
+    self.assertEqual(P.get_bm_steer_deadzone(env, 10.0, 0.018)[0], 0)
 
   def test_a_gate_opens_on_highway_accel(self):
     from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope

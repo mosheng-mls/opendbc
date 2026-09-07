@@ -73,8 +73,8 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       )
     limited_torque = apply_driver_steer_torque_limits(new_torque, apply_torque_last,
                                                       driver_torque, limits, steer_max)
-    # Hard-clipping to a newly lower cap (1500→800) can exceed panda rate and
-    # the frame is rejected, not clamped. Slew the rail the same as torque.
+    # Keep requests continuous when the cap decreases, e.g. 1500→800.
+    # The legacy pack reapplies its historical hard cap in update().
     down = int(getattr(limits, "STEER_DELTA_DOWN", CarControllerParams.STEER_DELTA_DOWN))
     if limited_torque > steer_max:
       limited_torque = max(steer_max, int(apply_torque_last) - down)
@@ -224,8 +224,11 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       engine_speed_ms = getattr(CS, "engine_speed_ms", getattr(CS.out, "vEgoRaw", 0.0))
       steer_max = CarControllerParams.get_bm_steer_max(engine_speed_ms, CC.actuators.curvature, env)
       steer_deltas = CarControllerParams.get_bm_steer_deltas(engine_speed_ms, CC.actuators.curvature, env)
+      if env == SteerEnvelope.OPTIMIZED_1300 and abs(self.apply_torque_last) > CarControllerParams.STEER_MAX_STABLE:
+        # Retire inherited 1500-pack torque before using the slower 1300 rates.
+        steer_deltas = (steer_deltas[0], CarControllerParams.STEER_DELTA_DOWN_STABLE)
       steer_allowance = CarControllerParams.get_bm_steer_allowance(env)
-      deadzone, _ = CarControllerParams.get_bm_steer_deadzone(env)
+      deadzone, _ = CarControllerParams.get_bm_steer_deadzone(env, engine_speed_ms, CC.actuators.curvature)
 
     # Stop / crawl on a straight: hold still. Curvature gate keeps 90°/180 from a crawl.
     desired_curvature = float(CC.actuators.curvature or 0.0)
@@ -234,10 +237,11 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       (CS.out.standstill or v_ego < CarControllerParams.STEER_HOLD_SPEED_MS) and
       abs(desired_curvature) < CarControllerParams.STEER_DEADZONE_CURVATURE
     )
-    blinker_suspend = self.bm_low_speed_steer and bm_blinker_suspends_lkas(
+    # The weekend stable pack had no additional send-boundary blinker pause.
+    blinker_suspend = (self.bm_low_speed_steer and self._steer_envelope != SteerEnvelope.STABLE_1300 and bm_blinker_suspends_lkas(
       bool(getattr(CS.out, "leftBlinker", False)),
       bool(getattr(CS.out, "rightBlinker", False)),
-    )
+    ))
     if blinker_suspend != self._blinker_lkas_suspend:
       print(f"BM blinker LKAS suspend {int(self._blinker_lkas_suspend)}->{int(blinker_suspend)}", flush=True)
       self._blinker_lkas_suspend = blinker_suspend
@@ -254,10 +258,14 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       apply_torque = self._apply_steer_limits(new_torque, self.apply_torque_last,
                                               CS.out.steeringTorque, steer_max, steer_deltas,
                                               steer_allowance)
+      if self.bm_low_speed_steer and env == SteerEnvelope.STABLE_1300:
+        apply_torque = max(-steer_max, min(steer_max, apply_torque))
+    elif self.bm_low_speed_steer and env == SteerEnvelope.OPTIMIZED_1300 and not CC.latActive:
+      # A disabled optimized pack must not keep transmitting a bleed-down tail.
+      apply_torque = 0
     elif blinker_suspend:
-      # Stock FSC drops LKAS_REQUEST with the turn signal. Bleeding at the
-      # straight 6/8 rate left 1500 on the bus for ~2 s and tripped OEM DTC.
-      # 25 counts / 10 ms is panda BM max_rate_down — fastest legal drop.
+      # Use a bounded 25-count bleed for an active pack's single turn signal.
+      # EPS acceptance of this transition still requires vehicle validation.
       apply_torque = bleed_steer_to_zero(
         self.apply_torque_last, CarControllerParams.STEER_BLINKER_DELTA_DOWN)
     elif hold_steer:

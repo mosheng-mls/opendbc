@@ -13,19 +13,27 @@ Ecu = CarParams.Ecu
 
 
 # Steer torque packs (MazdaSteerEnvelope):
-#   0 STABLE_1300 — one cap 1300
+#   0 STABLE_1300 — weekend 1300 pack; 800 base and original rates/deadzone
 #   1 TEST        — reserved 1500/800 (kappa gate + 65-70 km/h taper)
 #   2 A_GATE      — city kappa gate, highway opens on a = v^2 * |kappa|
+#   3 OPTIMIZED_1300 — smooth straight-road requests, demand-based 800..1300
 
 class SteerEnvelope:
   STABLE_1300 = 0
   TEST = 1
   A_GATE = 2
+  OPTIMIZED_1300 = 3
 
 
 class CarControllerParams:
   STEER_MAX = 800                 # non-BM Mazda platforms; also 1500-pack floor
   STEER_MAX_STABLE = 1300
+  STEER_MAX_STABLE_SPEED_LOOKUP = ([0.0, 20.0 * CV.KPH_TO_MS, 35.0 * CV.KPH_TO_MS], [1300.0, 1300.0, 800.0])
+  STEER_MAX_STABLE_CURVATURE_LOOKUP = ([0.025, 0.05], [0.0, 1.0])
+  STEER_OPTIMIZED_A0 = 0.8       # PC candidate: start adding authority
+  STEER_OPTIMIZED_A1 = 1.8       # PC candidate: fully open to 1300
+  STEER_DELTA_UP_STABLE = 10
+  STEER_DELTA_DOWN_STABLE = 25
   STEER_MAX_BM = 1500             # TEST / A_GATE peak; panda BM max
   STEER_CURVE_KAPPA = 0.008       # faster rates once the path is a real turn
   STEER_KAPPA0 = 0.003
@@ -73,13 +81,32 @@ class CarControllerParams:
       return SteerEnvelope.TEST
     if env == SteerEnvelope.A_GATE:
       return SteerEnvelope.A_GATE
+    if env == SteerEnvelope.OPTIMIZED_1300:
+      return SteerEnvelope.OPTIMIZED_1300
     return SteerEnvelope.STABLE_1300
+
+  @classmethod
+  def get_bm_optimized_demand(cls, v_ego: float, desired_curvature: float) -> float:
+    if not np.isfinite(v_ego) or not np.isfinite(desired_curvature):
+      return 0.0
+    v = max(float(v_ego), 0.0)
+    a = v * v * abs(float(desired_curvature))
+    q = cls._clip01((a - cls.STEER_OPTIMIZED_A0) / (cls.STEER_OPTIMIZED_A1 - cls.STEER_OPTIMIZED_A0))
+    return q * q * (3.0 - 2.0 * q)
 
   @classmethod
   def get_bm_steer_max(cls, v_ego: float, desired_curvature: float, envelope: int | None = None) -> int:
     env = cls.normalize_envelope(envelope)
-    if env == SteerEnvelope.STABLE_1300:
-      return int(cls.STEER_MAX_STABLE)
+    if env in (SteerEnvelope.STABLE_1300, SteerEnvelope.OPTIMIZED_1300):
+      if not np.isfinite(v_ego) or not np.isfinite(desired_curvature):
+        return int(cls.STEER_MAX)
+      speed_cap = np.interp(max(v_ego, 0.0), *cls.STEER_MAX_STABLE_SPEED_LOOKUP)
+      curve_weight = np.interp(abs(desired_curvature), *cls.STEER_MAX_STABLE_CURVATURE_LOOKUP)
+      steer_max = cls.STEER_MAX + curve_weight * (speed_cap - cls.STEER_MAX)
+      if env == SteerEnvelope.OPTIMIZED_1300:
+        q = cls.get_bm_optimized_demand(v_ego, desired_curvature)
+        steer_max = max(steer_max, cls.STEER_MAX + q * (cls.STEER_MAX_STABLE - cls.STEER_MAX))
+      return int(round(steer_max))
 
     v = float(v_ego) if np.isfinite(v_ego) else 0.0
     k = abs(float(desired_curvature)) if np.isfinite(desired_curvature) else 0.0
@@ -104,15 +131,31 @@ class CarControllerParams:
   @classmethod
   def get_bm_steer_deltas(cls, v_ego: float, desired_curvature: float = 0.0,
                           envelope: int | None = None) -> tuple[int, int]:
-    _ = v_ego, envelope
+    env = cls.normalize_envelope(envelope)
     curve = abs(float(desired_curvature)) if np.isfinite(desired_curvature) else 0.0
+    if env == SteerEnvelope.STABLE_1300:
+      if np.isfinite(v_ego) and v_ego <= cls.STEER_DELTA_LOW_SPEED_MAX:
+        return cls.STEER_DELTA_UP_LOW_SPEED, cls.STEER_DELTA_DOWN_LOW_SPEED
+      return cls.STEER_DELTA_UP_STABLE, cls.STEER_DELTA_DOWN_STABLE
+    if env == SteerEnvelope.OPTIMIZED_1300:
+      if np.isfinite(v_ego) and v_ego <= cls.STEER_DELTA_LOW_SPEED_MAX and curve >= cls.STEER_CURVE_KAPPA:
+        return cls.STEER_DELTA_UP_LOW_SPEED, cls.STEER_DELTA_DOWN_LOW_SPEED
+      q = cls.get_bm_optimized_demand(v_ego, desired_curvature)
+      return (int(round(cls.STEER_DELTA_UP + q * (cls.STEER_DELTA_UP_STABLE - cls.STEER_DELTA_UP))),
+              int(round(cls.STEER_DELTA_DOWN + q * (cls.STEER_DELTA_DOWN_STABLE - cls.STEER_DELTA_DOWN))))
     if curve >= cls.STEER_CURVE_KAPPA:
       return cls.STEER_DELTA_UP_TURN, cls.STEER_DELTA_DOWN_TURN
     return cls.STEER_DELTA_UP, cls.STEER_DELTA_DOWN
 
   @classmethod
-  def get_bm_steer_deadzone(cls, envelope: int | None = None) -> tuple[int, float]:
-    del envelope
+  def get_bm_steer_deadzone(cls, envelope: int | None = None, v_ego: float = 0.0,
+                           desired_curvature: float = 0.0) -> tuple[int, float]:
+    env = cls.normalize_envelope(envelope)
+    if env == SteerEnvelope.STABLE_1300:
+      return 0, cls.STEER_DEADZONE_CURVATURE
+    if env == SteerEnvelope.OPTIMIZED_1300:
+      q = cls.get_bm_optimized_demand(v_ego, desired_curvature)
+      return int(round(cls.STEER_DEADZONE * (1.0 - q))), cls.STEER_DEADZONE_CURVATURE
     return cls.STEER_DEADZONE, cls.STEER_DEADZONE_CURVATURE
 
   @classmethod
