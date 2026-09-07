@@ -2,6 +2,7 @@
 from opendbc.car import get_safety_config, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarInterfaceBase
+from opendbc.car.mazda.bm_longitudinal_guard import BM_ACCEL_MAX, BM_ACCEL_MIN
 from opendbc.car.mazda.carcontroller import CarController
 from opendbc.car.mazda.carstate import CarState
 from opendbc.car.mazda.radar_interface import RadarInterface
@@ -32,6 +33,7 @@ class CarInterface(CarInterfaceBase):
       ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.VISION_ONLY_RADAR.value
       ret.pcmCruise = True
       ret.longitudinalActuatorDelay = 0.30
+      ret.stopAccel = BM_ACCEL_MIN
 
     # LONG-007: this Mazda3's OEM ACC exits near 30 km/h and has no verified
     # stop-and-go state to resume. Keep generic Mazda auto-resume available for
@@ -55,6 +57,12 @@ class CarInterface(CarInterfaceBase):
     ret.centerToFront = ret.wheelbase * 0.41
 
     return ret
+
+  @staticmethod
+  def get_pid_accel_limits(CP, current_speed, cruise_speed):
+    if CP.carFingerprint == CAR.MAZDA_3_2019 and CP.openpilotLongitudinalControl:
+      return BM_ACCEL_MIN, BM_ACCEL_MAX
+    return CarInterfaceBase.get_pid_accel_limits(CP, current_speed, cruise_speed)
 
   def get_low_demand_p_torque_cap(self) -> float | None:
     # MAZDA_3_2019 reuses GEN1 MAZDA_3 body specs and CX9 torque substitute.

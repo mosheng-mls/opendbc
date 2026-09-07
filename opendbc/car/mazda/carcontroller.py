@@ -5,17 +5,17 @@ from opendbc.car import Bus, structs
 from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
-from opendbc.car.mazda.bm_radar_session import BMRadarSessionInput, BMRadarSessionManager, BMRadarSessionState
+from opendbc.car.mazda.bm_longitudinal_guard import BM_ACCEL_MIN as BM_DIRECT_LONG_ACCEL_MIN, BM_ACCEL_MAX as BM_DIRECT_LONG_ACCEL_MAX
+from opendbc.car.mazda.bm_radar_session import BMRadarSessionInput, BMRadarSessionManager, may_replace_crz, may_replace_radar_tracks
 from opendbc.car.mazda.values import CAR, CarControllerParams, Buttons, SteerEnvelope
 
 from opendbc.sunnypilot.car.mazda.icbm import IntelligentCruiseButtonManagementInterface
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 BM_VISION_LONG_BUSES = (0, 2)
-BM_DIRECT_LONG_ACCEL_MIN = -1.50
-BM_DIRECT_LONG_ACCEL_MAX = 0.60
 BM_DIRECT_LONG_ACCEL_DELTA_UP = 0.024
 BM_DIRECT_LONG_ACCEL_DELTA_DOWN = 0.030
+BM_DIRECT_LONG_COMFORT_DELTA_UP = 0.010  # 0.5 m/s^3 at 50 Hz, matching the supervisor
 BM_DIRECT_LONG_ACCEL_OFFSET = 4.096
 BM_DIRECT_LONG_ACCEL_SCALE = 1000.0
 
@@ -32,6 +32,11 @@ def slew_bm_direct_long_accel(target_accel: float, last_accel: float) -> float:
   last_milli = bm_direct_long_accel_to_milli(last_accel)
   up_milli = int(BM_DIRECT_LONG_ACCEL_DELTA_UP * BM_DIRECT_LONG_ACCEL_SCALE + 0.5)
   down_milli = int(BM_DIRECT_LONG_ACCEL_DELTA_DOWN * BM_DIRECT_LONG_ACCEL_SCALE + 0.5)
+  if target_milli > 0:
+    # The upstream ramp can finish while TX is still releasing braking.
+    # Bound positive growth against the actual sent command; keep brake release unchanged.
+    comfort_up_milli = int(BM_DIRECT_LONG_COMFORT_DELTA_UP * BM_DIRECT_LONG_ACCEL_SCALE + 0.5)
+    target_milli = min(target_milli, max(0, last_milli) + comfort_up_milli)
   tx_milli = max(last_milli - down_milli, min(last_milli + up_milli, target_milli))
   return tx_milli / BM_DIRECT_LONG_ACCEL_SCALE
 
@@ -91,6 +96,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.brake_counter = 0
     self.last_cancel_frame = -self.CANCEL_RETRY_FRAMES
     self.bm_radar_session = BMRadarSessionManager()
+    self._radar_shutdown_done = False
     self.bm_long_counter = 0
     self.bm_radar_counter = 0
     self.bm_tx_accel_last = 0.0
@@ -134,7 +140,18 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       return False
     return bool(CS.out.standstill or CS.out.cruiseState.standstill)
 
+  def shutdown_radar_session(self):
+    """Return one explicit handback request on card exit; RX recovery is separate."""
+    if not self.CP.openpilotLongitudinalControl or self._radar_shutdown_done:
+      return []
+    self._radar_shutdown_done = True
+    self.bm_tx_accel_last = 0.0
+    session = self.bm_radar_session.request_immediate_handback()
+    return [session.can_msg] if session.can_msg is not None else []
+
   def _update_bm_vision_longitudinal(self, CC, CS, can_sends):
+    if self._radar_shutdown_done:
+      return
     session = self.bm_radar_session.update(BMRadarSessionInput(
       requested=True,
       startup_gate_passed=bool(CS.bm_radar_startup_ready),
@@ -153,17 +170,14 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     if gas_override or not long_engaged:
       self.bm_tx_accel_last = 0.0
 
-    # Once the physical source disappears, cover the empty radar traffic on
-    # both separated harness sides. Verification frames stay inactive until
-    # the full one-second ownership guard has passed.
-    radar_master = (session.state in (BMRadarSessionState.VERIFY_SILENT, BMRadarSessionState.SILENCED) and
-                    not CS.stock_radar_alive)
-    if radar_master and self.frame % 10 == 0:
+    # Inactive CRZ can fill the vacuum during verification. Empty radar tracks
+    # must wait for the full one-second ownership guard on both harness sides.
+    if may_replace_radar_tracks(session.state, CS.stock_radar_alive) and self.frame % 10 == 0:
       for bus in BM_VISION_LONG_BUSES:
         can_sends.extend(mazdacan.create_bm_no_target_radar_frames(bus, self.bm_radar_counter))
       self.bm_radar_counter += 1
 
-    if radar_master and self.frame % 2 == 0:
+    if may_replace_crz(session.state, CS.stock_radar_alive) and self.frame % 2 == 0:
       acc_available = bool(CS.out.cruiseState.available)
       gap_setting = int(CC.hudControl.leadDistanceBars) or 2
       tx_engaged = long_engaged if direct_ready else False
