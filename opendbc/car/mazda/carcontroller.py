@@ -100,6 +100,7 @@ class CarController(CarControllerBase):
     self.bm_radar_counter = 0
     self.bm_tx_accel_last = 0.0
     self._steer_envelope = SteerEnvelope.STABLE_1300
+    self._steer_envelope_latched = False
     self._blinker_lkas_suspend = False
     self._params = None
     try:
@@ -230,17 +231,25 @@ class CarController(CarControllerBase):
     steer_allowance = None
     deadzone = CarControllerParams.STEER_DEADZONE
     v_ego = float(getattr(CS.out, "vEgo", 0.0) or 0.0)
+    one_blinker = bm_blinker_suspends_lkas(
+      bool(getattr(CS.out, "leftBlinker", False)),
+      bool(getattr(CS.out, "rightBlinker", False)),
+    )
     if self.bm_low_speed_steer:
-      if self.frame % 10 == 0:
+      if not self._steer_envelope_latched:
         self._steer_envelope = self._read_steer_envelope()
+        self._steer_envelope_latched = True
       env = self._steer_envelope
       engine_speed_ms = getattr(CS, "engine_speed_ms", getattr(CS.out, "vEgoRaw", 0.0))
-      steer_max = CarControllerParams.get_bm_steer_max(engine_speed_ms, CC.actuators.curvature, env)
-      steer_deltas = CarControllerParams.get_bm_steer_deltas(engine_speed_ms, CC.actuators.curvature, env)
+      steer_angle_deg = float(getattr(CS.out, "steeringAngleDeg", 0.0) or 0.0)
+      steer_max = CarControllerParams.get_bm_steer_max(
+        engine_speed_ms, CC.actuators.curvature, env, steer_angle_deg=steer_angle_deg)
+      steer_deltas = CarControllerParams.get_bm_steer_deltas(
+        engine_speed_ms, CC.actuators.curvature, env, blinker=one_blinker)
       if env == SteerEnvelope.OPTIMIZED_1300 and abs(self.apply_torque_last) > CarControllerParams.STEER_MAX_STABLE:
         # Retire inherited 1500-pack torque before using the slower 1300 rates.
         steer_deltas = (steer_deltas[0], CarControllerParams.STEER_DELTA_DOWN_STABLE)
-      steer_allowance = CarControllerParams.get_bm_steer_allowance(env)
+      steer_allowance = CarControllerParams.get_bm_steer_allowance(env, blinker=one_blinker)
       deadzone, _ = CarControllerParams.get_bm_steer_deadzone(env, engine_speed_ms, CC.actuators.curvature)
 
     # Stop / crawl on a straight: hold still. Curvature gate keeps 90°/180 from a crawl.
@@ -250,11 +259,10 @@ class CarController(CarControllerBase):
       (CS.out.standstill or v_ego < CarControllerParams.STEER_HOLD_SPEED_MS) and
       abs(desired_curvature) < CarControllerParams.STEER_DEADZONE_CURVATURE
     )
-    # The weekend stable pack had no additional send-boundary blinker pause.
-    blinker_suspend = (self.bm_low_speed_steer and self._steer_envelope != SteerEnvelope.STABLE_1300 and bm_blinker_suspends_lkas(
-      bool(getattr(CS.out, "leftBlinker", False)),
-      bool(getattr(CS.out, "rightBlinker", False)),
-    ))
+    # Weekend 1300 and the universal 1500 pack keep sending. Other packs still bleed to 0.
+    blinker_suspend = (self.bm_low_speed_steer and
+                       CarControllerParams.zeros_lkas_on_blinker(self._steer_envelope) and
+                       one_blinker)
     if blinker_suspend != self._blinker_lkas_suspend:
       print(f"BM blinker LKAS suspend {int(self._blinker_lkas_suspend)}->{int(blinker_suspend)}", flush=True)
       self._blinker_lkas_suspend = blinker_suspend

@@ -27,6 +27,7 @@ class TestMazdaLateralTorque(unittest.TestCase):
         vCruise=255.0,
         vEgo=2.0,
         vEgoRaw=2.0,
+        steeringAngleDeg=0.0,
         standstill=False,
         gearShifter=structs.CarState.GearShifter.drive,
         leftBlinker=False,
@@ -75,6 +76,7 @@ class TestMazdaSteerSmoothness(unittest.TestCase):
     self.assertGreaterEqual(deadzone, 30)
     self.assertGreaterEqual(curv, 0.002)
     self.assertEqual(P.get_bm_steer_deadzone(SteerEnvelope.STABLE_1300)[0], 0)
+    self.assertEqual(P.get_bm_steer_deadzone(SteerEnvelope.UNIVERSAL_1500)[0], P.STEER_DEADZONE)
 
   def test_stable_1300_envelope(self):
     from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope
@@ -154,8 +156,52 @@ class TestMazdaSteerSmoothness(unittest.TestCase):
     self.assertEqual(P.normalize_envelope(None), SteerEnvelope.STABLE_1300)
     self.assertEqual(P.normalize_envelope(99), SteerEnvelope.STABLE_1300)
     self.assertEqual(P.normalize_envelope(2), SteerEnvelope.A_GATE)
+    self.assertEqual(P.normalize_envelope(4), SteerEnvelope.UNIVERSAL_1500)
     self.assertEqual(P.get_bm_steer_max(kph(8), 0.05), 1300)
     self.assertEqual(P.get_bm_steer_max(kph(8), 0.05, None), 1300)
+
+  def test_universal_1500_daily_demand_pack(self):
+    from opendbc.car.mazda.values import CarControllerParams as P, SteerEnvelope
+    kph = lambda v: v / 3.6
+    env = SteerEnvelope.UNIVERSAL_1500
+    self.assertEqual(env, 4)
+    cases = (
+      (2, 0.05, 1300),
+      (8, 0.0, 800),
+      (8, 0.05, 1300),
+      (20, 0.04, 1350),
+      (35, 0.01356, 1500),
+      (45, 0.008, 1500),
+      (70, 0.008, 1500),
+      (80, 0.008, 1500),
+      (80, 0.006, 1290),
+      (100, 0.0008, 800),
+      (100, 0.002, 800),
+      (100, 0.0045, 1024),
+      (100, 0.05, 1500),
+    )
+    for speed, curvature, expected in cases:
+      with self.subTest(speed=speed, curvature=curvature):
+        self.assertEqual(P.get_bm_steer_max(kph(speed), curvature, env), expected)
+        self.assertEqual(P.get_bm_steer_max(kph(speed), -curvature, env), expected)
+    self.assertEqual(P.get_bm_steer_max(kph(20), 0.05, env, steer_angle_deg=400.0), 1300)
+    self.assertEqual(P.get_bm_steer_max(kph(8), 0.0, env, steer_angle_deg=400.0), 800)
+    for invalid in (float("nan"), float("inf"), float("-inf")):
+      self.assertEqual(P.get_bm_steer_max(invalid, 0.05, env), 800)
+      self.assertEqual(P.get_bm_steer_max(kph(8), invalid, env), 800)
+    self.assertEqual(P.get_bm_steer_deadzone(env)[0], P.STEER_DEADZONE)
+    self.assertEqual(P.get_bm_steer_deadzone(env, 10.0, 0.05)[0], 0)
+    self.assertEqual(P.get_bm_steer_deltas(10.0, 0.0, env), (6, 8))
+    self.assertEqual(P.get_bm_steer_deltas(10.0, 0.05, env), (10, 15))
+    self.assertEqual(P.get_bm_steer_deltas(8 / 3.6, 0.05, env), (10, 15))
+    self.assertEqual(P.get_bm_steer_deltas(8 / 3.6, 0.05, env, blinker=True), (10, 25))
+    self.assertEqual(P.get_bm_steer_allowance(env), P.STEER_DRIVER_ALLOWANCE_TEST)
+    self.assertEqual(P.get_bm_steer_allowance(env, blinker=True), P.STEER_DRIVER_ALLOWANCE_BM)
+    self.assertFalse(P.zeros_lkas_on_blinker(env))
+    self.assertFalse(P.zeros_lkas_on_blinker(SteerEnvelope.STABLE_1300))
+    self.assertTrue(P.zeros_lkas_on_blinker(SteerEnvelope.TEST))
+    self.assertTrue(P.zeros_lkas_on_blinker(SteerEnvelope.A_GATE))
+    self.assertTrue(P.zeros_lkas_on_blinker(SteerEnvelope.OPTIMIZED_1300))
 
 
 class TestMazdaBlinkerLkasSuspend(unittest.TestCase):
@@ -192,6 +238,70 @@ class TestMazdaBlinkerLkasSuspend(unittest.TestCase):
     clipped = CarController._apply_steer_limits(0, 1400, 0.0, 800)
     self.assertGreater(clipped, 800)
     self.assertLessEqual(1400 - clipped, 8)
+
+  def _bm_controller(self, env, *, left_blinker=False, torque=0.5, curvature=0.05):
+    cp = CarInterface.get_non_essential_params(CAR.MAZDA_3_2019)
+    controller = CarController(DBC[CAR.MAZDA_3_2019], cp)
+    controller.frame = 5
+    controller._steer_envelope = env
+    controller._read_steer_envelope = lambda: env
+    cc = structs.CarControl()
+    cc.enabled = True
+    cc.latActive = True
+    cc.actuators.torque = torque
+    cc.actuators.curvature = curvature
+    cs = SimpleNamespace(
+      out=SimpleNamespace(
+        brakePressed=False,
+        steeringTorque=0.0,
+        vCruise=255.0,
+        vEgo=20.0,
+        vEgoRaw=20.0,
+        steeringAngleDeg=0.0,
+        standstill=False,
+        gearShifter=structs.CarState.GearShifter.drive,
+        leftBlinker=left_blinker,
+        rightBlinker=False,
+        steerFaultTemporary=False,
+        steerFaultPermanent=False,
+        cruiseState=SimpleNamespace(enabled=False, available=False, speed=0.0),
+        canValid=True,
+        canTimeout=False,
+        buttonEvents=[],
+      ),
+      engine_speed_ms=20.0,
+      lkas_blocked=False,
+      crz_btns_counter=0,
+      cam_lkas={"BIT_1": 0, "ERR_BIT_1": 0, "ERR_BIT_2": 0},
+    )
+    return controller, cc, cs
+
+  def test_universal_1500_keeps_torque_on_blinker(self):
+    from opendbc.car.mazda.values import SteerEnvelope
+    controller, cc, cs = self._bm_controller(SteerEnvelope.UNIVERSAL_1500, left_blinker=True)
+    actuators, _ = controller.update(cc.as_reader(), cs, 0)
+    self.assertNotEqual(actuators.torqueOutputCan, 0)
+    self.assertGreater(abs(actuators.torqueOutputCan), 0)
+
+  def test_test_pack_still_zeros_on_blinker(self):
+    from opendbc.car.mazda.values import SteerEnvelope
+    controller, cc, cs = self._bm_controller(SteerEnvelope.TEST, left_blinker=True)
+    controller.apply_torque_last = 800
+    actuators, _ = controller.update(cc.as_reader(), cs, 0)
+    self.assertLess(abs(actuators.torqueOutputCan), 800)
+    self.assertEqual(actuators.torqueOutputCan, 775)
+
+  def test_envelope_latches_for_the_rest_of_the_drive(self):
+    from opendbc.car.mazda.values import SteerEnvelope
+    controller, cc, cs = self._bm_controller(SteerEnvelope.UNIVERSAL_1500)
+    self.assertFalse(controller._steer_envelope_latched)
+    controller.update(cc.as_reader(), cs, 0)
+    self.assertTrue(controller._steer_envelope_latched)
+    self.assertEqual(controller._steer_envelope, SteerEnvelope.UNIVERSAL_1500)
+    controller._read_steer_envelope = lambda: SteerEnvelope.STABLE_1300
+    controller.frame = 10
+    controller.update(cc.as_reader(), cs, 0)
+    self.assertEqual(controller._steer_envelope, SteerEnvelope.UNIVERSAL_1500)
 
 
 if __name__ == "__main__":

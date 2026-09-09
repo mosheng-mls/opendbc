@@ -17,12 +17,15 @@ Ecu = CarParams.Ecu
 #   1 TEST        — reserved 1500/800 (kappa gate + 65-70 km/h taper)
 #   2 A_GATE      — city kappa gate, highway opens on a = v^2 * |kappa|
 #   3 OPTIMIZED_1300 — smooth straight-road requests, demand-based 800..1300
+#   4 UNIVERSAL_1500 — daily demand pack: 800 straight, kappa opens to 1500,
+#     crawl peak 1300, no blinker zero
 
 class SteerEnvelope:
   STABLE_1300 = 0
   TEST = 1
   A_GATE = 2
   OPTIMIZED_1300 = 3
+  UNIVERSAL_1500 = 4
 
 
 class CarControllerParams:
@@ -54,6 +57,7 @@ class CarControllerParams:
   STEER_DELTA_LOW_SPEED_MAX = 15.0 * CV.KPH_TO_MS
   STEER_DRIVER_ALLOWANCE = 15
   STEER_DRIVER_ALLOWANCE_TEST = 17
+  STEER_DRIVER_ALLOWANCE_BM = 22     # panda BM driver_torque_allowance; blinker yield only
   STEER_DRIVER_MULTIPLIER = 1
   STEER_DRIVER_FACTOR = 1
   STEER_STEP = 1  # 100 Hz
@@ -61,6 +65,16 @@ class CarControllerParams:
   STEER_DEADZONE_TEST = 36
   STEER_DEADZONE_CURVATURE = 0.0025
   STEER_HOLD_SPEED_MS = 1.4  # ~5 kph; standstill bounce still counts as stopped
+  # Pack 4 daily: kappa-only (do not use a=v^2*k; highway speed makes that a 1500 switch).
+  STEER_DAILY_SPEED_PEAK_LOOKUP = (
+    [0.0, 15.0 * CV.KPH_TO_MS, 35.0 * CV.KPH_TO_MS, 120.0 * CV.KPH_TO_MS],
+    [1300.0, 1300.0, 1500.0, 1500.0],
+  )
+  STEER_DAILY_KAPPA_LOOKUP = ([0.0025, 0.005, 0.007], [0.0, 0.40, 1.0])
+  STEER_DAILY_GARAGE_KPH = 20.0
+  STEER_DAILY_GARAGE_ANGLE_DEG = 90.0
+  STEER_DELTA_UP_DAILY = 10
+  STEER_DELTA_DOWN_DAILY = 15
 
   def __init__(self, CP):
     pass
@@ -83,7 +97,15 @@ class CarControllerParams:
       return SteerEnvelope.A_GATE
     if env == SteerEnvelope.OPTIMIZED_1300:
       return SteerEnvelope.OPTIMIZED_1300
+    if env == SteerEnvelope.UNIVERSAL_1500:
+      return SteerEnvelope.UNIVERSAL_1500
     return SteerEnvelope.STABLE_1300
+
+  @classmethod
+  def get_bm_daily_q(cls, desired_curvature: float) -> float:
+    if not np.isfinite(desired_curvature):
+      return 0.0
+    return float(np.interp(abs(float(desired_curvature)), *cls.STEER_DAILY_KAPPA_LOOKUP))
 
   @classmethod
   def get_bm_optimized_demand(cls, v_ego: float, desired_curvature: float) -> float:
@@ -95,8 +117,29 @@ class CarControllerParams:
     return q * q * (3.0 - 2.0 * q)
 
   @classmethod
-  def get_bm_steer_max(cls, v_ego: float, desired_curvature: float, envelope: int | None = None) -> int:
+  def zeros_lkas_on_blinker(cls, envelope: int | None = None) -> bool:
+    # Weekend 1300 and the Saturday-based 1500 pack keep sending. Later 1500
+    # packs bleed to 0 while exactly one turn signal is on.
+    return cls.normalize_envelope(envelope) not in (
+      SteerEnvelope.STABLE_1300,
+      SteerEnvelope.UNIVERSAL_1500,
+    )
+
+  @classmethod
+  def get_bm_steer_max(cls, v_ego: float, desired_curvature: float, envelope: int | None = None,
+                       steer_angle_deg: float = 0.0) -> int:
     env = cls.normalize_envelope(envelope)
+    if env == SteerEnvelope.UNIVERSAL_1500:
+      if not np.isfinite(v_ego) or not np.isfinite(desired_curvature):
+        return int(cls.STEER_MAX)
+      v = max(float(v_ego), 0.0)
+      speed_peak = float(np.interp(v, *cls.STEER_DAILY_SPEED_PEAK_LOOKUP))
+      v_kph = v * 3.6
+      if (v_kph <= cls.STEER_DAILY_GARAGE_KPH and np.isfinite(steer_angle_deg) and
+          abs(float(steer_angle_deg)) >= cls.STEER_DAILY_GARAGE_ANGLE_DEG):
+        speed_peak = min(speed_peak, float(cls.STEER_MAX_STABLE))
+      q = cls.get_bm_daily_q(desired_curvature)
+      return int(round(cls.STEER_MAX + q * (speed_peak - cls.STEER_MAX)))
     if env in (SteerEnvelope.STABLE_1300, SteerEnvelope.OPTIMIZED_1300):
       if not np.isfinite(v_ego) or not np.isfinite(desired_curvature):
         return int(cls.STEER_MAX)
@@ -130,13 +173,23 @@ class CarControllerParams:
 
   @classmethod
   def get_bm_steer_deltas(cls, v_ego: float, desired_curvature: float = 0.0,
-                          envelope: int | None = None) -> tuple[int, int]:
+                          envelope: int | None = None, blinker: bool = False) -> tuple[int, int]:
     env = cls.normalize_envelope(envelope)
     curve = abs(float(desired_curvature)) if np.isfinite(desired_curvature) else 0.0
     if env == SteerEnvelope.STABLE_1300:
       if np.isfinite(v_ego) and v_ego <= cls.STEER_DELTA_LOW_SPEED_MAX:
         return cls.STEER_DELTA_UP_LOW_SPEED, cls.STEER_DELTA_DOWN_LOW_SPEED
       return cls.STEER_DELTA_UP_STABLE, cls.STEER_DELTA_DOWN_STABLE
+    if env == SteerEnvelope.UNIVERSAL_1500:
+      q = cls.get_bm_daily_q(desired_curvature)
+      if np.isfinite(v_ego) and v_ego <= cls.STEER_DELTA_LOW_SPEED_MAX:
+        up, down = cls.STEER_DELTA_UP_DAILY, cls.STEER_DELTA_DOWN_DAILY
+      else:
+        up = int(round(cls.STEER_DELTA_UP + q * (cls.STEER_DELTA_UP_DAILY - cls.STEER_DELTA_UP)))
+        down = int(round(cls.STEER_DELTA_DOWN + q * (cls.STEER_DELTA_DOWN_DAILY - cls.STEER_DELTA_DOWN)))
+      if blinker:
+        down = cls.STEER_BLINKER_DELTA_DOWN
+      return up, down
     if env == SteerEnvelope.OPTIMIZED_1300:
       if np.isfinite(v_ego) and v_ego <= cls.STEER_DELTA_LOW_SPEED_MAX and curve >= cls.STEER_CURVE_KAPPA:
         return cls.STEER_DELTA_UP_LOW_SPEED, cls.STEER_DELTA_DOWN_LOW_SPEED
@@ -153,14 +206,20 @@ class CarControllerParams:
     env = cls.normalize_envelope(envelope)
     if env == SteerEnvelope.STABLE_1300:
       return 0, cls.STEER_DEADZONE_CURVATURE
+    if env == SteerEnvelope.UNIVERSAL_1500:
+      q = cls.get_bm_daily_q(desired_curvature)
+      return int(round(cls.STEER_DEADZONE * (1.0 - q))), cls.STEER_DEADZONE_CURVATURE
     if env == SteerEnvelope.OPTIMIZED_1300:
       q = cls.get_bm_optimized_demand(v_ego, desired_curvature)
       return int(round(cls.STEER_DEADZONE * (1.0 - q))), cls.STEER_DEADZONE_CURVATURE
     return cls.STEER_DEADZONE, cls.STEER_DEADZONE_CURVATURE
 
   @classmethod
-  def get_bm_steer_allowance(cls, envelope: int | None = None) -> int:
-    if cls.normalize_envelope(envelope) in (SteerEnvelope.TEST, SteerEnvelope.A_GATE):
+  def get_bm_steer_allowance(cls, envelope: int | None = None, blinker: bool = False) -> int:
+    env = cls.normalize_envelope(envelope)
+    if env == SteerEnvelope.UNIVERSAL_1500 and blinker:
+      return cls.STEER_DRIVER_ALLOWANCE_BM
+    if env in (SteerEnvelope.TEST, SteerEnvelope.A_GATE, SteerEnvelope.UNIVERSAL_1500):
       return cls.STEER_DRIVER_ALLOWANCE_TEST
     return cls.STEER_DRIVER_ALLOWANCE
 

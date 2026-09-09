@@ -230,10 +230,11 @@ class CarState(CarStateBase):
     pt_messages = []
     cam_messages = []
     if CP.openpilotLongitudinalControl:
-      # CRZ_INFO and RADAR_TRACK_1 are expected to disappear after takeover, so
-      # they deliberately have no liveness requirement. vl_all supplies per-cycle
-      # arrival data.
+      # Radar-owned frames disappear after takeover, so they have no liveness
+      # requirement. vl_all supplies per-cycle arrival data. CRZ_CTRL is the
+      # same family as CRZ_INFO: accessing vl["CRZ_CTRL"] must not trip canError.
       pt_messages.append(("CRZ_INFO", float("nan")))
+      pt_messages.append(("CRZ_CTRL", float("nan")))
       pt_messages.append(("RADAR_TRACK_1", float("nan")))
       cam_messages.append(("CAM_LANEINFO", 0))
     return {

@@ -191,6 +191,7 @@ class TestBMRadarControllerSession(unittest.TestCase):
     self.controller.bm_radar_counter = 0
     self.controller.bm_tx_accel_last = 0.0
     self.controller._steer_envelope = SteerEnvelope.STABLE_1300
+    self.controller._steer_envelope_latched = True
     self.controller._blinker_lkas_suspend = False
     self.controller._read_steer_envelope = lambda: SteerEnvelope.STABLE_1300
     cc = structs.CarControl()
