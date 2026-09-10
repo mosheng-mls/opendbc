@@ -77,6 +77,7 @@ class BMRadarSessionInput:
   stock_radar_alive: bool
   vehicle_standstill: bool
   stock_cruise_engaged: bool
+  longitudinal_takeover: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,13 +90,11 @@ class BMRadarSessionOutput:
 
 
 class BMRadarSessionManager:
-  """Fail-closed ownership handshake for the BM forward radar.
+  """CX5-style radar silence: start as soon as OP long is selected.
 
-  Takeover starts only while stationary and with stock cruise disengaged.  A
-  recovered radar while SILENCED is a two-master hazard, so it latches FAULT
-  instead of trying to re-silence while driving.  Clearing a fault requires the
-  experimental request to be turned off and the stock radar to be observed
-  alive again.
+  BM still uses the 2 Hz PROGRAMMING + tester-present loop instead of CX5's
+  blocking init query. Do not wait for standstill, FSC settle, or longActive.
+  A recovered radar while SILENCED latches FAULT so we do not dual-TX.
   """
 
   def __init__(self) -> None:
@@ -146,19 +145,12 @@ class BMRadarSessionManager:
       elif self.state == BMRadarSessionState.FAULT:
         self._transition(BMRadarSessionState.STOCK if inp.stock_radar_alive else BMRadarSessionState.HANDBACK)
     else:
-      if self.state == BMRadarSessionState.STOCK:
-        self._transition(BMRadarSessionState.WAITING_GATE)
+      if self.state in (BMRadarSessionState.STOCK, BMRadarSessionState.WAITING_GATE):
+        next_state = BMRadarSessionState.SILENCING if inp.stock_radar_alive else BMRadarSessionState.VERIFY_SILENT
+        self._transition(next_state)
 
-      if self.state == BMRadarSessionState.WAITING_GATE:
-        safe_to_start = inp.startup_gate_passed and inp.vehicle_standstill and not inp.stock_cruise_engaged
-        if safe_to_start:
-          next_state = BMRadarSessionState.SILENCING if inp.stock_radar_alive else BMRadarSessionState.VERIFY_SILENT
-          self._transition(next_state)
-
-      elif self.state == BMRadarSessionState.SILENCING:
-        if not inp.vehicle_standstill or inp.stock_cruise_engaged:
-          self._transition(BMRadarSessionState.HANDBACK)
-        elif not inp.stock_radar_alive:
+      if self.state == BMRadarSessionState.SILENCING:
+        if not inp.stock_radar_alive:
           self._transition(BMRadarSessionState.VERIFY_SILENT)
         elif self._frames_in_state >= BM_RADAR_SILENCE_TIMEOUT_FRAMES:
           self._transition(BMRadarSessionState.FAULT, "RADAR_SILENCE_TIMEOUT")

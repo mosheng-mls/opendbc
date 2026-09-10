@@ -12,6 +12,8 @@ from opendbc.car.mazda.values import CAR, CarControllerParams, Buttons, SteerEnv
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 BM_VISION_LONG_BUSES = (0, 2)
+BM_VISION_HUD_SYNC_MIN_KPH = 30.0
+BM_VISION_HUD_SYNC_DEADBAND_MPS = 0.14  # ~0.5 kph
 BM_DIRECT_LONG_ACCEL_DELTA_UP = 0.024
 BM_DIRECT_LONG_ACCEL_DELTA_DOWN = 0.030
 BM_DIRECT_LONG_COMFORT_DELTA_UP = 0.010  # 0.5 m/s^3 at 50 Hz, matching the supervisor
@@ -154,10 +156,10 @@ class CarController(CarControllerBase):
       return
     session = self.bm_radar_session.update(BMRadarSessionInput(
       requested=True,
-      startup_gate_passed=bool(CS.bm_radar_startup_ready),
+      startup_gate_passed=True,
       stock_radar_alive=bool(CS.stock_radar_alive),
       vehicle_standstill=bool(CS.out.standstill),
-      stock_cruise_engaged=bool(CS.out.cruiseState.enabled),
+      stock_cruise_engaged=False,
     ))
     if session.can_msg is not None:
       can_sends.append(session.can_msg)
@@ -180,8 +182,10 @@ class CarController(CarControllerBase):
     if may_replace_crz(session.state, CS.stock_radar_alive) and self.frame % 2 == 0:
       acc_available = bool(CS.out.cruiseState.available)
       gap_setting = int(CC.hudControl.leadDistanceBars) or 2
-      tx_engaged = long_engaged if direct_ready else False
-      if gas_override or not tx_engaged:
+      # Cluster CRZ_ACTIVE (green) follows OP long as soon as we own CRZ, even
+      # during the silent-verify window. Accel TX still waits for direct_ready.
+      tx_engaged = bool(CC.longActive and not CS.out.brakePressed and not gas_override)
+      if gas_override or not long_engaged:
         tx_accel = 0.0
       else:
         target_accel = max(BM_DIRECT_LONG_ACCEL_MIN, min(BM_DIRECT_LONG_ACCEL_MAX, float(CC.actuators.accel)))
@@ -195,6 +199,29 @@ class CarController(CarControllerBase):
           bus, tx_engaged, acc_available, gap_setting,
         ))
       self.bm_long_counter += 1
+
+    self._update_bm_vision_hud_set_sync(CC, CS, can_sends)
+
+  def _update_bm_vision_hud_set_sync(self, CC, CS, can_sends):
+    """Align cluster CRZ_EVENTS SET with openpilot vCruise above 30 kph."""
+    if not (CC.enabled and CC.longActive):
+      return
+    target_ms = persistent_cruise_target_ms(float(CS.out.vCruise))
+    if target_ms <= 0.0 or (target_ms * 3.6) < BM_VISION_HUD_SYNC_MIN_KPH:
+      return
+    cluster_ms = float(CS.out.cruiseState.speed)
+    if cluster_ms <= 0.0:
+      return
+    button = self.icbm.update(
+      self.frame,
+      enabled=True,
+      cruise_enabled=bool(CS.out.cruiseState.available),
+      cruise_speed_ms=cluster_ms,
+      target_speed_ms=target_ms,
+      deadband_ms=BM_VISION_HUD_SYNC_DEADBAND_MPS,
+    )
+    if button is not None and self.frame % 10 == 0:
+      can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, button))
 
   def _read_steer_envelope(self) -> int:
     raw = None

@@ -6,10 +6,7 @@ from opendbc.car.mazda.values import CAR, DBC, LKAS_LIMITS
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
-FSC_SETTLE_FRAMES = int(10.0 / DT_CTRL)
 STOCK_RADAR_ALIVE_FRAMES = int(0.05 / DT_CTRL)
-STOCK_RADAR_OWNERSHIP_FRAMES = STOCK_RADAR_ALIVE_FRAMES + int(1.0 / DT_CTRL)
-CANCEL_CONTEXT_FRAMES = int(0.5 / DT_CTRL)
 STOCK_RADAR_LIVENESS = (
   ("CRZ_INFO", "CTR1"),
   ("RADAR_TRACK_1", "LONG_DIST"),
@@ -41,15 +38,13 @@ class CarState(CarStateBase):
     self.stock_radar_alive = True
     self.stock_radar_has_lead = False
     self.stock_radar_lead_valid = False
-    self.bm_radar_startup_ready = False
+    self.bm_radar_startup_ready = True
     self._stock_radar_silent_frames = 0
-    self._radar_was_silenced = False
-    self._cam_laneinfo_seen = False
-    self._fsc_settled_frames = 0
     self._cruise_available = False
     self._cruise_enabled = False
     self._brake_pressed_prev = False
-    self._cancel_context_frames = 0
+    self._cancel_latched = False
+    self._acc_armed_prev = False
 
   @staticmethod
   def _stock_radar_seen(cp) -> bool:
@@ -62,6 +57,28 @@ class CarState(CarStateBase):
       except (KeyError, TypeError):
         continue
     return False
+
+  @staticmethod
+  def update_bm_vision_cruise_flags(acc_armed, acc_active, cancel_pressed, brake_released_edge,
+                                    cancel_latched, acc_armed_prev, cruise_available, cruise_enabled,
+                                    radar_was_silenced=False):
+    # CX5: available = ACC_OFF or ACC_ACTIVE, enabled = ACC_ACTIVE.
+    # Cancel stays off until the next MAIN rising edge. SET also clears Cancel.
+    if cancel_pressed:
+      cancel_latched = True
+    if acc_armed and not acc_armed_prev:
+      cancel_latched = False
+    if acc_active:
+      cancel_latched = False
+
+    if cancel_latched:
+      cruise_available = False
+      cruise_enabled = False
+    else:
+      cruise_available = bool(acc_armed or acc_active)
+      cruise_enabled = bool(acc_active)
+
+    return bool(cruise_available), bool(cruise_enabled), bool(cancel_latched)
 
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
@@ -127,37 +144,20 @@ class CarState(CarStateBase):
       acc_armed = cp.vl["PEDALS"]["ACC_OFF"] == 1
       acc_active = cp.vl["PEDALS"]["ACC_ACTIVE"] == 1
       brake_released_edge = not ret.brakePressed and self._brake_pressed_prev
-      if cp.vl["CRZ_BTNS"]["CAN_OFF"] == 1:
-        self._cancel_context_frames = CANCEL_CONTEXT_FRAMES
-      elif self._cancel_context_frames > 0:
-        self._cancel_context_frames -= 1
-      if acc_armed or acc_active:
-        self._cruise_available = True
-      elif brake_released_edge or self._cancel_context_frames > 0:
-        self._cruise_available = False
-      self._cruise_enabled = acc_active
-
-      ret.cruiseState.enabled = self._cruise_enabled
-
-      # Returned TX echoes use bus+128 and never enter this bus-0 parser, so
-      # CRZ_INFO / RADAR_TRACK_1 arrivals here represent the physical stock source.
       if self._stock_radar_seen(cp):
         self._stock_radar_silent_frames = 0
       else:
         self._stock_radar_silent_frames += 1
       self.stock_radar_alive = self._stock_radar_silent_frames < STOCK_RADAR_ALIVE_FRAMES
-      self._radar_was_silenced |= self._stock_radar_silent_frames >= STOCK_RADAR_OWNERSHIP_FRAMES
-      ret.cruiseState.available = self._cruise_available and self._radar_was_silenced and not self.stock_radar_alive
-      ret.accFaulted = self._radar_was_silenced and self.stock_radar_alive
-
-      # Wait until the FSC has completed its boot/radar-presence phase before
-      # requesting the diagnostic session. Requiring an observed frame avoids
-      # treating the parser's initial all-zero values as a stable camera.
-      self._cam_laneinfo_seen |= len(cp_cam.vl_all["CAM_LANEINFO"]["LANE_LINES"]) > 0
-      laneinfo = cp_cam.vl["CAM_LANEINFO"]
-      fsc_settled = self._cam_laneinfo_seen and not any(laneinfo[s] for s in ("NO_ERR_BIT", "BIT2", "ERR_BIT"))
-      self._fsc_settled_frames = self._fsc_settled_frames + 1 if fsc_settled else 0
-      self.bm_radar_startup_ready = self._fsc_settled_frames >= FSC_SETTLE_FRAMES
+      self._cruise_available, self._cruise_enabled, self._cancel_latched = self.update_bm_vision_cruise_flags(
+        acc_armed, acc_active, cp.vl["CRZ_BTNS"]["CAN_OFF"] == 1, brake_released_edge,
+        self._cancel_latched, self._acc_armed_prev, self._cruise_available, self._cruise_enabled,
+      )
+      self._acc_armed_prev = acc_armed
+      ret.cruiseState.enabled = self._cruise_enabled
+      ret.cruiseState.available = self._cruise_available
+      ret.accFaulted = False
+      self.bm_radar_startup_ready = True
     else:
       # TODO: the signal used for available seems to be the adaptive cruise signal, instead of the main on
       #       it should be used for carState.cruiseState.nonAdaptive instead
@@ -172,7 +172,10 @@ class CarState(CarStateBase):
 
     # stock lkas should be on
     # TODO: is this needed?
-    ret.invalidLkasSetting = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0
+    if self.CP.openpilotLongitudinalControl:
+      ret.invalidLkasSetting = False
+    else:
+      ret.invalidLkasSetting = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0
 
     if ret.cruiseState.enabled:
       if not self.lkas_allowed_speed and self.acc_active_last:

@@ -20,13 +20,14 @@ from opendbc.car.mazda.bm_radar_session import (
 )
 
 
-def session_input(*, requested=True, gate=True, alive=True, standstill=True, cruise=False):
+def session_input(*, requested=True, gate=True, alive=True, standstill=True, cruise=False, takeover=False):
   return BMRadarSessionInput(
     requested=requested,
     startup_gate_passed=gate,
     stock_radar_alive=alive,
     vehicle_standstill=standstill,
     stock_cruise_engaged=cruise,
+    longitudinal_takeover=takeover,
   )
 
 
@@ -52,12 +53,17 @@ class TestBMRadarSessionManager(unittest.TestCase):
     self.assertIsNone(out.can_msg)
     self.assertFalse(out.direct_longitudinal_ready)
 
-  def test_takeover_waits_for_all_gates(self):
+  def test_silence_starts_without_parked_cruise_off_gates(self):
     for kwargs in ({"gate": False}, {"standstill": False}, {"cruise": True}):
       with self.subTest(kwargs=kwargs):
         out = BMRadarSessionManager().update(session_input(**kwargs))
-        self.assertEqual(out.state, BMRadarSessionState.WAITING_GATE)
-        self.assertIsNone(out.can_msg)
+        self.assertEqual(out.state, BMRadarSessionState.SILENCING)
+        self.assertIsNotNone(out.can_msg)
+
+  def test_silence_starts_while_moving_with_cruise(self):
+    out = BMRadarSessionManager().update(session_input(standstill=False, cruise=True))
+    self.assertEqual(out.state, BMRadarSessionState.SILENCING)
+    self.assertIsNotNone(out.can_msg)
 
   def test_programming_then_tester_present(self):
     manager = BMRadarSessionManager()
@@ -76,14 +82,11 @@ class TestBMRadarSessionManager(unittest.TestCase):
     self.assertEqual(out.state, BMRadarSessionState.SILENCED)
     self.assertTrue(out.direct_longitudinal_ready)
 
-  def test_abort_takeover_if_vehicle_moves(self):
+  def test_silencing_continues_if_vehicle_moves(self):
     manager = BMRadarSessionManager()
     manager.update(session_input())
     out = manager.update(session_input(standstill=False, alive=True))
-    self.assertEqual(out.state, BMRadarSessionState.HANDBACK)
-    self.assertEqual(out.can_msg.dat, bytes.fromhex("0210010000000000"))
-    out = manager.update(session_input(requested=False, standstill=False, alive=True))
-    self.assertEqual(out.state, BMRadarSessionState.STOCK)
+    self.assertEqual(out.state, BMRadarSessionState.SILENCING)
 
   def test_handback_sends_default_until_radar_returns(self):
     manager = BMRadarSessionManager()
@@ -234,11 +237,20 @@ class TestBMRadarControllerSession(unittest.TestCase):
       crz.extend(msg for msg in msgs if msg.address == 0x21B)
     self.assertEqual(self.controller.bm_radar_session.state, BMRadarSessionState.VERIFY_SILENT)
     self.assertTrue(crz)
-    self.assertTrue(all(msg.dat[4] & 0x02 == 0 for msg in crz))
+    self.assertTrue(all(msg.dat[4] & 0x02 for msg in crz))
     msgs = [msg for _ in range(10) for msg in self.step()]
     for bus in (0, 2):
       self.assertEqual(self.radar_addresses & {msg.address for msg in msgs if msg.src == bus}, self.radar_addresses)
     self.assertTrue(any(msg.address == 0x21B and msg.dat[4] & 0x02 for msg in msgs))
+
+  def test_radar_silences_before_long_active(self):
+    cc = self.cc.as_builder()
+    cc.longActive = False
+    cc.enabled = False
+    self.cc = cc.as_reader()
+    msgs = self.step()
+    self.assertEqual(self.controller.bm_radar_session.state, BMRadarSessionState.SILENCING)
+    self.assertTrue({BM_RADAR_ADDR} & {msg.address for msg in msgs})
 
   def test_stock_mode_update_and_shutdown_emit_no_longitudinal_frames(self):
     self.controller.CP.openpilotLongitudinalControl = False
@@ -247,10 +259,9 @@ class TestBMRadarControllerSession(unittest.TestCase):
     self.assertEqual(self.controller.bm_radar_session.state, BMRadarSessionState.STOCK)
     self.assertEqual(self.controller.shutdown_radar_session(), [])
 
-  def test_shutdown_before_takeover_is_zero_tx(self):
-    self.cs.bm_radar_startup_ready = False
-    self.step()
-    self.assertEqual(self.controller.bm_radar_session.state, BMRadarSessionState.WAITING_GATE)
+  def test_shutdown_before_silence_is_zero_tx(self):
+    self.cs.stock_radar_alive = True
+    self.assertEqual(self.controller.bm_radar_session.state, BMRadarSessionState.STOCK)
     self.assertEqual(self.controller.shutdown_radar_session(), [])
 
   def test_shutdown_emits_one_handback_and_stops_future_longitudinal_tx(self):

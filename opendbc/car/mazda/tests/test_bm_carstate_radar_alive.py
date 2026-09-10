@@ -38,6 +38,29 @@ class TestBMCarStateRadarAlive(unittest.TestCase):
     oem = CarState.get_can_parsers(NS(openpilotLongitudinalControl=False, carFingerprint=CAR.MAZDA_3_2019))
     self.assertFalse(any(state.name == "CRZ_CTRL" for state in oem[Bus.pt].message_states.values()))
 
+  def test_cancel_latches_available_until_main_rising(self):
+    flags = CarState.update_bm_vision_cruise_flags
+    available, enabled, latched = flags(True, False, True, False, False, True, True, False, False)
+    self.assertFalse(available)
+    self.assertFalse(enabled)
+    self.assertTrue(latched)
+    available, enabled, latched = flags(True, False, False, False, True, True, False, False, False)
+    self.assertFalse(available)
+    self.assertTrue(latched)
+    available, enabled, latched = flags(True, False, False, False, True, False, False, False, False)
+    self.assertTrue(available)
+    self.assertFalse(latched)
+
+  def test_acc_active_enables_without_radar_silence(self):
+    flags = CarState.update_bm_vision_cruise_flags
+    available, enabled, latched = flags(True, True, False, False, False, True, True, False, False)
+    self.assertTrue(available)
+    self.assertTrue(enabled)
+    available, enabled, latched = flags(True, False, False, False, False, True, True, True, True)
+    self.assertTrue(available)
+    self.assertFalse(enabled)
+    self.assertFalse(latched)
+
 
 if __name__ == "__main__":
   unittest.main()
